@@ -82,9 +82,11 @@ This library handles the gap as follows:
 - **`did_revoked`** and **`flag_added` / `flag_removed`** are
   passed through as received. A compromised proxy between the
   consumer and the registry could, in principle, fabricate them.
-  Pass `{ dropUnsignedEvents: true }` to `MoltrustCaepClient` to
-  suppress the typed handlers for these event types (they still
-  fire on the generic `'event'` channel for diagnostics).
+  The client **defaults to `dropUnsignedEvents: true`** — typed
+  handlers fire only for cryptographically-verified events.
+  Operators who need to act on these unsigned events can opt in
+  with `dropUnsignedEvents: false`; the client emits a Node
+  `MoltrustInsecureEventsWarning` on start in that mode.
 - The registry roadmap includes signed CAEP envelopes; once
   shipped, that work will land here as **Profile v2** with a
   documented migration path.
@@ -134,6 +136,12 @@ This library does all five steps in `MoltrustVerifier`.
   polling rarely captures anything new.
 - On 429, the library obeys `Retry-After` and exponentially backs
   off (jittered) per affected DID.
+- For DIDs that may accumulate event backlogs (e.g. after a long
+  outage), set `pageLimit: 500` (the registry maximum) so each
+  poll drains as much as possible. The library does NOT poll
+  faster than the rate-limit window even when `has_more: true` —
+  high-throughput catch-up should come from larger pages, not
+  from increased request frequency.
 
 ## Future channels
 

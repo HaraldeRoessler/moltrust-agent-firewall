@@ -43,9 +43,18 @@ export function isValidDid(value: unknown): value is Did {
 
 export function assertValidDid(value: unknown, context: string): asserts value is Did {
   if (!isValidDid(value)) {
-    const safe = typeof value === 'string' ? value.slice(0, 60) : '(non-string)';
+    // Don't reflect the value verbatim — a misuse-passed credential or
+    // PII fragment shouldn't bleed into logs / observability pipes via
+    // this error. Report only the kind and length, which is enough
+    // for the caller to identify their bug without exposing content.
+    const shape =
+      typeof value !== 'string'
+        ? `(non-string: ${typeof value})`
+        : value.length === 0
+          ? '(empty string)'
+          : `(string of length ${value.length})`;
     throw new MoltrustFirewallError(
-      `invalid DID '${safe}' (${context})`,
+      `invalid DID ${shape} (${context})`,
       'invalid_did',
     );
   }
@@ -133,6 +142,24 @@ export async function fetchWithTimeout(
       );
     }
     throw err;
+  }
+}
+
+/**
+ * Asserts that a Response carries an `application/json` Content-Type.
+ *
+ * Defends against a misconfigured (or malicious) registry serving
+ * text/html / text/javascript that `response.json()` would happily
+ * try to parse, masking an unexpected content path or making
+ * any reflected body harder to reason about.
+ */
+export function assertJsonResponse(response: Response, url: string): void {
+  const ct = response.headers.get('content-type') ?? '';
+  if (!ct.toLowerCase().includes('application/json')) {
+    throw new MoltrustFirewallError(
+      `expected application/json from ${url}, got '${ct || '(none)'}'`,
+      'unexpected_content_type',
+    );
   }
 }
 

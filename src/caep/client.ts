@@ -65,9 +65,15 @@ export interface MoltrustCaepClientOptions {
    * still observe them, just not act on them via the strong-typed
    * handlers).
    *
-   * Default: false (events processed as-is). The registry's roadmap
-   * includes signed CAEP envelopes — once shipped, that work will
-   * land here as Profile v2.
+   * **Default: true** (secure-by-default — typed handlers fire only
+   * for cryptographically-verified events). Pass `false` to opt in
+   * to acting on unsigned events; the client emits a Node
+   * `process.emitWarning` on start when this is set so operators
+   * can audit insecure configurations centrally.
+   *
+   * The registry's roadmap includes signed CAEP envelopes — once
+   * shipped, that work will land here as Profile v2 and this option
+   * will become a no-op for verified events.
    */
   dropUnsignedEvents?: boolean;
 }
@@ -95,6 +101,7 @@ export class MoltrustCaepClient extends EventEmitter {
   public readonly source: EventSource;
   private readonly autoVerify: boolean;
   private readonly dropUnsignedEvents: boolean;
+  private readonly inflightFetches = new Map<Did, Promise<VerifiedTrustScore>>();
   private started = false;
 
   constructor(opts: MoltrustCaepClientOptions = {}) {
@@ -118,12 +125,27 @@ export class MoltrustCaepClient extends EventEmitter {
         ...(opts.polling ?? {}),
       });
     this.autoVerify = opts.autoVerify ?? true;
-    this.dropUnsignedEvents = opts.dropUnsignedEvents ?? false;
+    // Secure-by-default: unsigned CAEP events (did_revoked, flag_*) are
+    // dropped from typed handlers unless the operator explicitly opts in.
+    this.dropUnsignedEvents = opts.dropUnsignedEvents ?? true;
+    // EventEmitter default is 10 — too low for fan-out into per-tenant
+    // gates or many gateway instances. 0 = unlimited; the application
+    // is in a better position than the library to bound listener counts.
+    this.setMaxListeners(0);
   }
 
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    if (!this.dropUnsignedEvents) {
+      process.emitWarning(
+        'MoltrustCaepClient started with dropUnsignedEvents=false. ' +
+          'did_revoked / flag_* events are passed to typed handlers without ' +
+          'cryptographic verification. A network attacker (TLS MitM, ' +
+          'compromised proxy) could fabricate them. See PROFILE.md for context.',
+        'MoltrustInsecureEventsWarning',
+      );
+    }
     await this.source.start((event) => this.handle(event));
   }
 
@@ -149,14 +171,36 @@ export class MoltrustCaepClient extends EventEmitter {
    * Returns a cached verified trust score if one is held and still
    * within its `valid_until`. Otherwise fetches and verifies a fresh
    * one (which also populates the cache).
+   *
+   * Concurrent calls for the same DID with no cached score are
+   * deduplicated via single-flight — only one network request is
+   * made; all callers await the same Promise. This bounds the
+   * outbound rate to the registry to roughly the number of distinct
+   * DIDs being asked about, not the number of callers.
+   *
+   * Callers in tight loops should still rate-limit themselves —
+   * the singleflight protects against burst storms across concurrent
+   * requests, but a serial loop without `await` between iterations
+   * will still fan out into rapid sequential fetches once each
+   * preceding one resolves.
    */
   async getVerifiedScore(did: Did): Promise<VerifiedTrustScore> {
     assertValidDid(did, 'MoltrustCaepClient.getVerifiedScore');
     const cached = this.cache.get(did);
     if (cached) return cached;
-    const fresh = await this.verifier.fetchAndVerify(did);
-    this.cache.set(fresh);
-    return fresh;
+    const existing = this.inflightFetches.get(did);
+    if (existing) return existing;
+    const promise = this.verifier
+      .fetchAndVerify(did)
+      .then((score) => {
+        this.cache.set(score);
+        return score;
+      })
+      .finally(() => {
+        this.inflightFetches.delete(did);
+      });
+    this.inflightFetches.set(did, promise);
+    return promise;
   }
 
   // EventEmitter typing — overrides to give callers strong types.

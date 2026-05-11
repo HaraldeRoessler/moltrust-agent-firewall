@@ -10,6 +10,7 @@ import {
 import { RegistryKeyDiscovery, type RegistryKeyDiscoveryOptions } from './registry-key.js';
 import { trustScoreSigningInput } from './jcs.js';
 import {
+  assertJsonResponse,
   assertValidDid,
   buildAuthHeaders,
   fetchWithTimeout,
@@ -68,6 +69,15 @@ export class MoltrustVerifier {
     );
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.allowExpired = opts.allowExpired ?? false;
+    if (this.allowExpired) {
+      process.emitWarning(
+        'MoltrustVerifier created with allowExpired=true. Expired trust ' +
+          'scores will be accepted as valid — typical only for graceful ' +
+          'degradation during a registry outage. NEVER use as a normal ' +
+          'production setting.',
+        'MoltrustExpiredScoresWarning',
+      );
+    }
     this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     const authOpts: { apiKey?: string; bearerToken?: string } = {};
     if (opts.apiKey !== undefined) authOpts.apiKey = opts.apiKey;
@@ -110,6 +120,7 @@ export class MoltrustVerifier {
         'http_error',
       );
     }
+    assertJsonResponse(response, url);
     let body: SignedTrustScoreResponse;
     try {
       body = (await response.json()) as SignedTrustScoreResponse;

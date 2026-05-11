@@ -9,6 +9,7 @@ import {
 } from '../types.js';
 import { MemoryStore } from '../cache/memory-store.js';
 import {
+  assertJsonResponse,
   assertValidDid,
   buildAuthHeaders,
   fetchWithTimeout,
@@ -96,6 +97,7 @@ export class PollingSource implements EventSource {
   private onEvent: ((event: CaepEvent) => void | Promise<void>) | null = null;
   private ackTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
+  private flushingAcks = false;
 
   constructor(opts: PollingSourceOptions = {}) {
     this.registryUrl = validateRegistryUrl(
@@ -244,6 +246,7 @@ export class PollingSource implements EventSource {
         'http_error',
       );
     }
+    assertJsonResponse(response, url);
     const body = (await response.json()) as CaepPendingResponse;
     if (!body || !Array.isArray(body.events)) {
       throw new MoltrustFirewallError(
@@ -266,9 +269,18 @@ export class PollingSource implements EventSource {
   }
 
   private async flushAcks(): Promise<void> {
-    const ids = await this.store.drainAcks();
-    if (ids.length === 0) return;
-    await Promise.allSettled(ids.map(async (id) => this.sendAck(id)));
+    // Skip if a previous flush is still in flight — prevents
+    // overlapping drains that would issue duplicate ack POSTs
+    // when the registry is slow or many acks are pending.
+    if (this.flushingAcks) return;
+    this.flushingAcks = true;
+    try {
+      const ids = await this.store.drainAcks();
+      if (ids.length === 0) return;
+      await Promise.allSettled(ids.map(async (id) => this.sendAck(id)));
+    } finally {
+      this.flushingAcks = false;
+    }
   }
 
   private async sendAck(eventId: string): Promise<void> {

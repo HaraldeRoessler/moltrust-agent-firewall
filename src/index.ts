@@ -7,6 +7,21 @@
  *
  * See PROFILE.md for the wire-protocol description.
  */
+
+import { MoltrustFirewallError } from './types.js';
+
+// Runtime engine check — package.json declares engines.node >= 18, but
+// that's advisory unless engine-strict is enabled in npm config. The
+// library uses AbortSignal.timeout which lands in Node 17.3+; throwing
+// here gives operators a clear error at module load rather than an
+// obscure "AbortSignal.timeout is not a function" later.
+if (typeof AbortSignal === 'undefined' || typeof AbortSignal.timeout !== 'function') {
+  throw new MoltrustFirewallError(
+    '@moltrust/agent-firewall requires Node 18 or later (AbortSignal.timeout is unavailable).',
+    'unsupported_runtime',
+  );
+}
+
 export {
   DEFAULT_KID,
   DEFAULT_REGISTRY,
@@ -46,6 +61,7 @@ export {
 export { EnforcementGate, type GateDecision, type GateOptions } from './firewall/gate.js';
 
 export {
+  assertJsonResponse,
   assertValidDid,
   isValidCaepEvent,
   isValidDid,

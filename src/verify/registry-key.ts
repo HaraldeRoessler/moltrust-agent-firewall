@@ -5,7 +5,7 @@ import {
   type JsonWebKey,
   type RegistryKey,
 } from '../types.js';
-import { fetchWithTimeout, validateRegistryUrl } from '../util/security.js';
+import { assertJsonResponse, fetchWithTimeout, validateRegistryUrl } from '../util/security.js';
 
 const MIN_CACHE_TTL_MS = 60_000; // never honour Cache-Control below 60s
 const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000; // 1h fallback
@@ -119,6 +119,7 @@ export class RegistryKeyDiscovery {
         'http_error',
       );
     }
+    assertJsonResponse(response, url);
     let jwk: JsonWebKey;
     try {
       jwk = (await response.json()) as JsonWebKey;

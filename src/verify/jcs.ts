@@ -10,6 +10,22 @@ import { MoltrustFirewallError } from '../types.js';
  * the signature can stay in lockstep.
  */
 export function jcsCanonicalize(payload: unknown): Uint8Array {
+  // JCS accepts any JSON value (object, array, string, number, boolean, null).
+  // Anything else — undefined, functions, symbols, BigInt — is non-serialisable
+  // and should be rejected before reaching the canonicaliser, where it would
+  // either return undefined or silently coerce.
+  const t = typeof payload;
+  if (
+    payload === undefined ||
+    t === 'function' ||
+    t === 'symbol' ||
+    t === 'bigint'
+  ) {
+    throw new MoltrustFirewallError(
+      `JCS input is not a JSON value (got ${payload === undefined ? 'undefined' : t})`,
+      'jcs_unserialisable',
+    );
+  }
   const out = canonicalize(payload as object);
   if (out === undefined) {
     throw new MoltrustFirewallError(

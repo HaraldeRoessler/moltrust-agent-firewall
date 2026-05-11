@@ -45,7 +45,11 @@ function makeKeyDiscovery(publicKey: Uint8Array, kid: string): RegistryKeyDiscov
 }
 
 describe('MoltrustVerifier', () => {
-  const sk = ed25519.utils.randomPrivateKey();
+  // Deterministic test key derived from a fixed 32-byte seed. Using a
+  // pinned secret makes intermittent test failures reproducible and lets
+  // signature regressions surface as exact-bytes diffs in CI.
+  const sk = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) sk[i] = i + 1; // 0x01..0x20
   const pk = ed25519.getPublicKey(sk);
   const kid = 'moltrust-registry-2026-v1';
 

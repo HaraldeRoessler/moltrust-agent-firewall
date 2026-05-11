@@ -187,7 +187,9 @@ See the inline TypeScript types for the full surface.
   validated end-to-end (the client re-fetches the signed score on
   receipt). For `did_revoked` / `flag_added` / `flag_removed`,
   authenticity rests on the TLS channel — see [PROFILE.md](./PROFILE.md#event-authenticity)
-  for full details and the `dropUnsignedEvents: true` opt-out.
+  for full details. The client **defaults to `dropUnsignedEvents: true`**
+  — typed handlers fire only on verified events. Set `false` to
+  opt in (emits a runtime warning).
 - **Authentication credentials are bearer-equivalent.** `apiKey` is
   sent as `X-API-Key`; the equivalent `bearerToken` option sends
   `Authorization: Bearer <token>`. Either is the registry's full
@@ -197,6 +199,23 @@ See the inline TypeScript types for the full surface.
   survive process restarts. Production deployments wanting durable
   revocation memory should pass their own `Set` backed by Redis or
   a DB (the gate mutates the supplied Set in place).
+- **`MemoryStore` (the default cursor backend) is also in-memory.**
+  After a process restart the polling client re-fetches anything
+  still in the registry's 90-day retention window for every watched
+  DID — operationally a thundering-herd risk at scale. For HA
+  deployments, implement the `Store` interface against Redis or a DB.
+- **`EnforcementGate` distinguishes transient from permanent errors.**
+  Permanent (`signature_invalid`, `invalid_did`, expired score) always
+  deny. Transient (`fetch_failed`, `request_timeout`, `rate_limited`,
+  `http_error`) deny by default but can fail-open via
+  `transientErrorPolicy: 'allow'` for high-availability gateways
+  willing to trade some safety for uptime during registry outages.
+- **`getVerifiedScore` is singleflight-deduplicated** — concurrent
+  calls for the same DID make at most one network request. This
+  bounds the rate to the registry to roughly the number of distinct
+  DIDs being asked about, not the number of callers. Serial
+  loops without `await` between iterations still fan out; rate-limit
+  callers should still respect the registry's published per-DID limits.
 - **The registry is a trusted upstream.** DID resolution, signup,
   and registration are all out of scope for this library; if you need
   to verify that a DID was legitimately registered, hit
