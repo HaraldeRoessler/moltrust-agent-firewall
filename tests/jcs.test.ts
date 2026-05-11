@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { jcsCanonicalize, trustScoreSigningInput } from '../src/verify/jcs.js';
+import { jcsCanonicalize } from '../src/verify/jcs.js';
 
 describe('jcsCanonicalize', () => {
   it('sorts object keys lexicographically', () => {
@@ -18,27 +18,20 @@ describe('jcsCanonicalize', () => {
     const out = jcsCanonicalize({ k: 'a\nb' });
     expect(new TextDecoder().decode(out)).toBe('{"k":"a\\nb"}');
   });
-});
 
-describe('trustScoreSigningInput', () => {
-  it('omits the registry_signature field but includes everything else', () => {
-    const input = {
+  it('produces the deterministic 5-field signing input the registry uses', () => {
+    // Mirrors app/signature.py build_score_signing_payload on the registry.
+    const payload = {
       did: 'did:moltrust:abc',
-      score: 75,
-      grade: 'B',
+      trust_score: null,
       computed_at: '2026-05-11T12:00:00Z',
       valid_until: '2026-05-11T13:00:00Z',
-      withheld: false,
-      registry_signature: { kid: 'k', alg: 'Ed25519', signature: 'deadbeef' },
+      policy_version: 'phase2',
     };
-    const bytes = trustScoreSigningInput(input);
-    const text = new TextDecoder().decode(bytes);
-    expect(text).not.toContain('registry_signature');
-    expect(text).toContain('"did":"did:moltrust:abc"');
-    expect(text).toContain('"score":75');
-  });
-
-  it('throws when registry_signature is missing', () => {
-    expect(() => trustScoreSigningInput({ did: 'x' })).toThrowError(/missing registry_signature/);
+    const text = new TextDecoder().decode(jcsCanonicalize(payload));
+    // Keys sorted lexicographically; null stays as null.
+    expect(text).toBe(
+      '{"computed_at":"2026-05-11T12:00:00Z","did":"did:moltrust:abc","policy_version":"phase2","trust_score":null,"valid_until":"2026-05-11T13:00:00Z"}',
+    );
   });
 });

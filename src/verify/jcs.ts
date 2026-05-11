@@ -36,19 +36,3 @@ export function jcsCanonicalize(payload: unknown): Uint8Array {
   return new TextEncoder().encode(out);
 }
 
-/**
- * Returns the byte sequence the registry signed for a trust-score
- * response — the JCS of every field except `registry_signature`.
- */
-export function trustScoreSigningInput(
-  response: Record<string, unknown>,
-): Uint8Array {
-  if (!('registry_signature' in response)) {
-    throw new MoltrustFirewallError(
-      'trust-score response is missing registry_signature',
-      'missing_signature',
-    );
-  }
-  const { registry_signature: _omitted, ...rest } = response;
-  return jcsCanonicalize(rest);
-}

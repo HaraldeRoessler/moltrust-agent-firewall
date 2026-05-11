@@ -5,12 +5,13 @@ import type { VerifiedTrustScore } from '../src/types.js';
 function score(did: string, validUntil: Date, value = 70): VerifiedTrustScore {
   return {
     did,
-    score: value,
+    trust_score: value,
     grade: 'B',
     computed_at: new Date(Date.now() - 1000),
     valid_until: validUntil,
     withheld: false,
-    signed_by: 'k',
+    signed_by: 'moltrust-registry-2026-v1',
+    policy_version: 'phase2',
     verified_at: new Date(),
   };
 }
@@ -24,7 +25,7 @@ describe('TrustCache', () => {
     const c = new TrustCache();
     const s = score('did:moltrust:a', new Date(Date.now() + 60_000));
     c.set(s);
-    expect(c.get('did:moltrust:a')?.score).toBe(70);
+    expect(c.get('did:moltrust:a')?.trust_score).toBe(70);
   });
 
   it('evicts entries past valid_until on read', () => {

@@ -1,6 +1,7 @@
 import { ed25519 } from '@noble/curves/ed25519';
 
 import {
+  DEFAULT_KID,
   DEFAULT_REGISTRY,
   MoltrustFirewallError,
   type Did,
@@ -8,7 +9,7 @@ import {
   type VerifiedTrustScore,
 } from '../types.js';
 import { RegistryKeyDiscovery, type RegistryKeyDiscoveryOptions } from './registry-key.js';
-import { trustScoreSigningInput } from './jcs.js';
+import { jcsCanonicalize } from './jcs.js';
 import {
   assertJsonResponse,
   assertValidDid,
@@ -130,7 +131,22 @@ export class MoltrustVerifier {
     return this.verifyResponse(body);
   }
 
-  /** Verify a trust-score response payload (already fetched). */
+  /**
+   * Verify a trust-score response payload (already fetched).
+   *
+   * Mirrors the registry's signing routine exactly (`app/signature.py` /
+   * `build_score_signing_payload` on `MoltyCel/moltrust-api:main`):
+   *
+   *   1. Build the deterministic 5-field minimal payload:
+   *        { did, trust_score, computed_at, valid_until, policy_version }
+   *      (NOT the whole response — the other fields are not covered by
+   *      the signature).
+   *   2. RFC 8785 (JCS) canonicalise.
+   *   3. Base64url-decode `registry_signature` to a 64-byte Ed25519 sig.
+   *   4. Verify against the current registry public key
+   *      (`moltrust-registry-2026-v1`), fetched from /.well-known/.
+   *   5. Reject if `valid_until` is in the past (unless `allowExpired`).
+   */
   async verifyResponse(response: SignedTrustScoreResponse): Promise<VerifiedTrustScore> {
     if (!response.registry_signature) {
       throw new MoltrustFirewallError(
@@ -138,15 +154,40 @@ export class MoltrustVerifier {
         'missing_signature',
       );
     }
-    if (response.registry_signature.alg !== 'Ed25519') {
+    if (typeof response.registry_signature !== 'string') {
       throw new MoltrustFirewallError(
-        `unsupported signature alg '${response.registry_signature.alg}' (only Ed25519 supported in v1)`,
-        'unsupported_alg',
+        'registry_signature must be a base64url-encoded string',
+        'invalid_signature_encoding',
       );
     }
-    const key = await this.keyDiscovery.getKey(response.registry_signature.kid);
-    const signingInput = trustScoreSigningInput(response as unknown as Record<string, unknown>);
-    const signatureBytes = hexDecode(response.registry_signature.signature);
+    const policyVersion = response.evaluation_context?.policy_version;
+    if (typeof policyVersion !== 'string' || policyVersion.length === 0) {
+      throw new MoltrustFirewallError(
+        'response is missing evaluation_context.policy_version (required for signature verification)',
+        'missing_policy_version',
+      );
+    }
+
+    const signingInput = jcsCanonicalize({
+      did: response.did,
+      trust_score: response.trust_score,
+      computed_at: response.computed_at,
+      valid_until: response.valid_until,
+      policy_version: policyVersion,
+    });
+
+    const signatureBytes = base64UrlDecode(response.registry_signature);
+    if (signatureBytes.length !== 64) {
+      throw new MoltrustFirewallError(
+        `expected 64-byte Ed25519 signature, got ${signatureBytes.length} bytes`,
+        'invalid_signature_encoding',
+      );
+    }
+
+    // The wire format does not carry a `kid` — every signature is
+    // produced by the registry's current key. Resolve it via the
+    // well-known endpoint (cached, with key-rotation tolerance).
+    const key = await this.keyDiscovery.getKey(DEFAULT_KID);
 
     let ok: boolean;
     try {
@@ -168,7 +209,7 @@ export class MoltrustVerifier {
     const validUntil = new Date(response.valid_until);
     if (Number.isNaN(validUntil.getTime())) {
       throw new MoltrustFirewallError(
-        `valid_until is not a valid ISO 8601 timestamp: ${response.valid_until}`,
+        `valid_until is not a valid ISO 8601 timestamp`,
         'invalid_valid_until',
       );
     }
@@ -182,19 +223,20 @@ export class MoltrustVerifier {
     const computedAt = new Date(response.computed_at);
     if (Number.isNaN(computedAt.getTime())) {
       throw new MoltrustFirewallError(
-        `computed_at is not a valid ISO 8601 timestamp: ${response.computed_at}`,
+        `computed_at is not a valid ISO 8601 timestamp`,
         'invalid_computed_at',
       );
     }
 
     return {
       did: response.did,
-      score: response.score,
+      trust_score: response.trust_score,
       grade: response.grade,
       computed_at: computedAt,
       valid_until: validUntil,
       withheld: response.withheld,
-      signed_by: response.registry_signature.kid,
+      signed_by: key.kid,
+      policy_version: policyVersion,
       verified_at: new Date(),
     };
   }
@@ -205,23 +247,18 @@ export class MoltrustVerifier {
   }
 }
 
-function hexDecode(s: string): Uint8Array {
-  if (s.length % 2 !== 0) {
+/** RFC 7515 base64url decode (no padding, '-' / '_' alphabet). */
+function base64UrlDecode(s: string): Uint8Array {
+  // Normalise: pad, swap to standard base64 alphabet.
+  const pad = s.length % 4;
+  const padded = pad ? s + '='.repeat(4 - pad) : s;
+  const std = padded.replace(/-/g, '+').replace(/_/g, '/');
+  // Refuse anything that's clearly not base64 alphabet at all.
+  if (!/^[A-Za-z0-9+/=]*$/.test(std)) {
     throw new MoltrustFirewallError(
-      `signature hex string has odd length (${s.length})`,
+      'registry_signature is not valid base64url',
       'invalid_signature_encoding',
     );
   }
-  const out = new Uint8Array(s.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    const byte = Number.parseInt(s.slice(i * 2, i * 2 + 2), 16);
-    if (Number.isNaN(byte)) {
-      throw new MoltrustFirewallError(
-        `signature is not valid hex at offset ${i * 2}`,
-        'invalid_signature_encoding',
-      );
-    }
-    out[i] = byte;
-  }
-  return out;
+  return new Uint8Array(Buffer.from(std, 'base64'));
 }

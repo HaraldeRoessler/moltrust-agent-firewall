@@ -89,34 +89,56 @@ export interface CaepPendingResponse {
   next_cursor: string | null;
 }
 
-/** Raw response from GET /skill/trust-score/{did}. */
+/** Raw response from `GET /skill/trust-score/{did}` (matches `api.moltrust.ch` wire format). */
 export interface SignedTrustScoreResponse {
   did: Did;
-  score: number | null;
+  /** 0..100, or `null` when withheld (Phase 2 requires ≥3 unique endorsers). */
+  trust_score: number | null;
+  /** A/B/C/D/N/A/REVOKED — the registry's grading. */
   grade: string | null;
-  computed_at: string;
-  valid_until: string;
+  /** Free-form breakdown of how the score was computed (informational). */
+  breakdown?: Record<string, unknown>;
+  endorser_count?: number;
   withheld: boolean;
-  /** Detached signature over the JCS canonicalisation of all fields except `registry_signature`. */
-  registry_signature: {
-    kid: string;
-    alg: 'Ed25519';
-    /** Hex-encoded Ed25519 signature. */
-    signature: string;
+  flags?: string[];
+  flag_count?: number;
+  computed_at: string;
+  /** Alias for `valid_until` used by older endpoints; ignored when both are present. */
+  cache_valid_until?: string;
+  /** When the score expires. The verifier rejects responses where this is in the past. */
+  valid_until: string;
+  consistency_level?: string;
+  evaluation_context: {
+    /** Identifies the scoring policy under which the response was signed. Part of the signed payload. */
+    policy_version: string;
+    evaluated_at?: number;
+    cache_valid_seconds?: number;
   };
+  /**
+   * Base64url-encoded Ed25519 signature (64 raw bytes → ~86 chars, no padding).
+   *
+   * The signature covers the JCS canonicalisation of a five-field minimal
+   * payload (NOT the whole response): `{did, trust_score, computed_at,
+   * valid_until, policy_version}`. The `kid` is implicit — every signature
+   * is produced by `moltrust-registry-2026-v1`, looked up via
+   * `/.well-known/registry-key.json`.
+   */
+  registry_signature: string;
 }
 
 /** Result of a successful verification. */
 export interface VerifiedTrustScore {
   did: Did;
-  score: number | null;
+  trust_score: number | null;
   grade: string | null;
   computed_at: Date;
   /** Score expiry. `EnforcementGate` refuses to use the score past this. */
   valid_until: Date;
   withheld: boolean;
-  /** Which `kid` signed this score. */
+  /** Which `kid` signed this score (always `moltrust-registry-2026-v1` for the current registry). */
   signed_by: string;
+  /** The scoring policy version that was signed (e.g. `phase2`). */
+  policy_version: string;
   /** Verification timestamp (when the local clock saw the signature pass). */
   verified_at: Date;
 }

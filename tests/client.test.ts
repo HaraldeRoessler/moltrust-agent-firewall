@@ -16,10 +16,6 @@ function base64UrlEncode(bytes: Uint8Array): string {
     .replace(/=+$/, '');
 }
 
-function hexEncode(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
 const TEST_SK = new Uint8Array(32);
 for (let i = 0; i < 32; i++) TEST_SK[i] = i + 1;
 const TEST_PK = ed25519.getPublicKey(TEST_SK);
@@ -38,20 +34,26 @@ function jwkResponse(): Response {
   );
 }
 
-function signedScoreResponse(did: string, score: number): Response {
-  const body = {
-    did,
-    score,
-    grade: 'A',
-    computed_at: new Date(Date.now() - 1_000).toISOString(),
-    valid_until: new Date(Date.now() + 3_600_000).toISOString(),
-    withheld: false,
-  };
-  const sig = ed25519.sign(jcsCanonicalize(body), TEST_SK);
+function signedScoreResponse(did: string, trust_score: number): Response {
+  const computed_at = new Date(Date.now() - 1_000).toISOString();
+  const valid_until = new Date(Date.now() + 3_600_000).toISOString();
+  const policy_version = 'phase2';
+  const signingPayload = { did, trust_score, computed_at, valid_until, policy_version };
+  const sig = ed25519.sign(jcsCanonicalize(signingPayload), TEST_SK);
   return new Response(
     JSON.stringify({
-      ...body,
-      registry_signature: { kid: KID, alg: 'Ed25519', signature: hexEncode(sig) },
+      did,
+      trust_score,
+      grade: 'A',
+      computed_at,
+      valid_until,
+      withheld: false,
+      evaluation_context: {
+        policy_version,
+        evaluated_at: Math.floor(Date.now() / 1000) - 1,
+        cache_valid_seconds: 3600,
+      },
+      registry_signature: base64UrlEncode(sig),
     }),
     { status: 200, headers: { 'content-type': 'application/json' } },
   );
@@ -77,7 +79,7 @@ describe('MoltrustCaepClient', () => {
       client.getVerifiedScore(did),
     ]);
 
-    expect(results.every((r) => r.score === 75)).toBe(true);
+    expect(results.every((r) => r.trust_score === 75)).toBe(true);
     const scoreFetches = calls.filter((u) => u.includes('/skill/trust-score/'));
     expect(scoreFetches.length).toBe(1); // singleflight collapsed the four concurrent calls
   });

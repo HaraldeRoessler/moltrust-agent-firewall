@@ -93,38 +93,62 @@ This library handles the gap as follows:
 
 ## Signed trust scores
 
-`GET /skill/trust-score/{did}` returns a payload of the form:
+`GET /skill/trust-score/{did}` returns a payload of the form (other
+fields like `breakdown`, `endorser_count`, `flags`, `flag_count`,
+`cache_valid_until`, `consistency_level` may also be present —
+they are informational and NOT covered by the signature):
 
 ```jsonc
 {
   "did": "did:moltrust:abc",
-  "score": 82,                       // 0–100, or null when withheld
-  "grade": "A",                      // or null
-  "computed_at": "2026-05-11T17:42:00Z",
-  "valid_until": "2026-05-11T18:42:00Z",
-  "withheld": false,                 // true if Phase 2 has < 3 unique endorsers
-  "registry_signature": {
-    "kid": "moltrust-registry-2026-v1",
-    "alg": "Ed25519",
-    "signature": "<hex>"             // Ed25519 sig (64 bytes, hex-encoded)
-  }
+  "trust_score": 82,                          // 0–100, or null when withheld
+  "grade": "A",                               // or null / "N/A" / "REVOKED"
+  "computed_at": "2026-05-11T13:17:44.727297+00:00",
+  "valid_until": "2026-05-11T14:17:44.727297+00:00",
+  "withheld": false,                          // true if Phase 2 has < 3 unique endorsers
+  "evaluation_context": {
+    "policy_version": "phase2",               // covered by the signature
+    "evaluated_at": 1778505464,               // not signed
+    "cache_valid_seconds": 3600               // not signed
+  },
+  "registry_signature": "8IZzYQXUkg3M...G"    // bare base64url string, ~86 chars
 }
 ```
 
-The signing input is the **RFC 8785 (JCS) canonicalisation** of every
-field above **except `registry_signature`**. Verifiers must:
+The signature is a 64-byte Ed25519 signature, base64url-encoded
+without padding. The **signing input is a deterministic 5-field
+minimal payload** — NOT the whole response. The signer (see
+`app/signature.py` in `MoltyCel/moltrust-api`) builds:
 
-1. Look up the public key for `registry_signature.kid` via
-   `/.well-known/registry-key.json` (with sensible caching).
-2. Strip `registry_signature` from the response.
-3. JCS-canonicalise the remainder.
-4. Ed25519-verify the canonicalised bytes against the published
-   public key.
-5. Reject if the local clock is past `valid_until` (the registry's
+```jsonc
+{
+  "did":            "did:moltrust:abc",
+  "trust_score":    82,
+  "computed_at":    "2026-05-11T13:17:44.727297+00:00",
+  "valid_until":    "2026-05-11T14:17:44.727297+00:00",
+  "policy_version": "phase2"
+}
+```
+
+…then RFC 8785 (JCS) canonicalises and Ed25519-signs that.
+
+The wire format does **not** carry a `kid` — every signature is
+produced by the registry's current key, which is discovered via
+`GET /.well-known/registry-key.json` (currently
+`moltrust-registry-2026-v1`).
+
+Verifiers (this library, `MoltrustVerifier`) must:
+
+1. Fetch the current public key from `/.well-known/registry-key.json`
+   (cached, with Cache-Control respected).
+2. Read `did`, `trust_score`, `computed_at`, `valid_until`, and
+   `evaluation_context.policy_version` from the response.
+3. JCS-canonicalise the 5-field object above.
+4. Base64url-decode `registry_signature` to 64 raw bytes.
+5. Ed25519-verify the bytes against the published public key.
+6. Reject if the local clock is past `valid_until` (the registry's
    recomputation cadence guarantees fresh values within the cache
    window).
-
-This library does all five steps in `MoltrustVerifier`.
 
 ## Polling cadence guidance
 

@@ -123,7 +123,7 @@ export class EnforcementGate {
     if (score.withheld && this.rejectWithheld) {
       return { allow: false, reason: 'denied_score_withheld', score };
     }
-    if (score.score === null || score.score < this.minScore) {
+    if (score.trust_score === null || score.trust_score < this.minScore) {
       return { allow: false, reason: 'denied_score_below_threshold', score };
     }
     return { allow: true, reason: 'allowed', score };

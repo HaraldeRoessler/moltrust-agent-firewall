@@ -43,7 +43,7 @@ export {
   type VerifiedTrustScore,
 } from './types.js';
 
-export { jcsCanonicalize, trustScoreSigningInput } from './verify/jcs.js';
+export { jcsCanonicalize } from './verify/jcs.js';
 export { RegistryKeyDiscovery, type RegistryKeyDiscoveryOptions } from './verify/registry-key.js';
 export { MoltrustVerifier, type VerifierOptions } from './verify/verifier.js';
 
