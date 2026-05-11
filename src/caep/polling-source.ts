@@ -52,6 +52,19 @@ export interface PollingSourceOptions {
    */
   maxAckRetries?: number;
   /**
+   * Hard cap on the number of DIDs this source watches at once
+   * (default 10_000). `watch()` throws `MoltrustFirewallError(code:
+   * 'too_many_watched_dids')` if exceeded. Guards memory if `watch()`
+   * is reachable from untrusted / unbounded input (e.g. a gateway
+   * that auto-watches every new counterparty DID).
+   */
+  maxWatchedDids?: number;
+  /**
+   * How often pending acks are flushed (default 5000 ms). High-volume
+   * consumers can tune this lower; idle consumers can raise it.
+   */
+  ackDrainIntervalMs?: number;
+  /**
    * Optional API key sent as `X-API-Key`. Prefer `bearerToken` for
    * Authorization: Bearer style. Mutually exclusive — `bearerToken` wins.
    */
@@ -76,6 +89,7 @@ const DEFAULT_PAGE_LIMIT = 100;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_ACK_CONCURRENCY = 10;
 const DEFAULT_MAX_ACK_RETRIES = 5;
+const DEFAULT_MAX_WATCHED_DIDS = 10_000;
 
 interface PerDidState {
   did: Did;
@@ -106,6 +120,8 @@ export class PollingSource implements EventSource {
   private readonly requestTimeoutMs: number;
   private readonly ackConcurrency: number;
   private readonly maxAckRetries: number;
+  private readonly maxWatchedDids: number;
+  private readonly ackDrainIntervalMs: number;
   /** event_id → retry attempts so far. Capped by `maxAckRetries`. */
   private readonly ackRetries = new Map<string, number>();
   private readonly headers: Record<string, string>;
@@ -115,7 +131,10 @@ export class PollingSource implements EventSource {
   private onEvent: ((event: CaepEvent) => void | Promise<void>) | null = null;
   private ackTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
-  private flushingAcks = false;
+  /** When non-null, a flush is in flight — `stop()` awaits it before returning. */
+  private flushAcksPromise: Promise<void> | null = null;
+  /** Wall-clock ms until which ack flushes should be paused (set by 429 Retry-After). */
+  private ackPauseUntil = 0;
 
   constructor(opts: PollingSourceOptions = {}) {
     this.registryUrl = validateRegistryUrl(
@@ -131,6 +150,8 @@ export class PollingSource implements EventSource {
     this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.ackConcurrency = Math.max(1, opts.ackConcurrency ?? DEFAULT_ACK_CONCURRENCY);
     this.maxAckRetries = Math.max(0, opts.maxAckRetries ?? DEFAULT_MAX_ACK_RETRIES);
+    this.maxWatchedDids = Math.max(1, opts.maxWatchedDids ?? DEFAULT_MAX_WATCHED_DIDS);
+    this.ackDrainIntervalMs = Math.max(1_000, opts.ackDrainIntervalMs ?? ACK_DRAIN_INTERVAL_MS);
     const authOpts: { apiKey?: string; bearerToken?: string } = {};
     if (opts.apiKey !== undefined) authOpts.apiKey = opts.apiKey;
     if (opts.bearerToken !== undefined) authOpts.bearerToken = opts.bearerToken;
@@ -141,6 +162,12 @@ export class PollingSource implements EventSource {
     this.logger = opts.logger ?? {};
     for (const did of opts.watch ?? []) {
       assertValidDid(did, 'PollingSource.watch');
+      if (this.states.size >= this.maxWatchedDids) {
+        throw new MoltrustFirewallError(
+          `cannot watch more than ${this.maxWatchedDids} DIDs (set maxWatchedDids to raise the cap)`,
+          'too_many_watched_dids',
+        );
+      }
       this.states.set(did, makeState(did));
     }
   }
@@ -156,13 +183,19 @@ export class PollingSource implements EventSource {
     for (const state of this.states.values()) this.schedule(state, 0);
     this.ackTimer = setInterval(() => {
       void this.flushAcks();
-    }, ACK_DRAIN_INTERVAL_MS);
+    }, this.ackDrainIntervalMs);
     if (this.ackTimer.unref) this.ackTimer.unref();
   }
 
   watch(did: Did): void {
     assertValidDid(did, 'PollingSource.watch');
     if (this.states.has(did)) return;
+    if (this.states.size >= this.maxWatchedDids) {
+      throw new MoltrustFirewallError(
+        `cannot watch more than ${this.maxWatchedDids} DIDs (set maxWatchedDids to raise the cap)`,
+        'too_many_watched_dids',
+      );
+    }
     const state = makeState(did);
     this.states.set(did, state);
     if (this.onEvent && !this.stopped) this.schedule(state, 0);
@@ -191,7 +224,16 @@ export class PollingSource implements EventSource {
       if (state.inflight) state.inflight.abort();
     }
     this.states.clear();
-    // Last best-effort ack flush.
+    // If a previous flush is in flight, wait for it to settle (so
+    // we don't drop acks on shutdown). Then run one final flush to
+    // drain anything still pending in the store.
+    if (this.flushAcksPromise) {
+      try {
+        await this.flushAcksPromise;
+      } catch (err) {
+        this.logger.warn?.('in-flight ack flush errored during stop()', err);
+      }
+    }
     await this.flushAcks();
     this.onEvent = null;
   }
@@ -315,23 +357,39 @@ export class PollingSource implements EventSource {
   }
 
   private async flushAcks(): Promise<void> {
-    if (this.flushingAcks) {
+    if (this.flushAcksPromise) {
       this.logger.debug?.('flushAcks: previous drain still in flight; tick skipped');
+      return this.flushAcksPromise;
+    }
+    if (this.ackPauseUntil > Date.now()) {
+      this.logger.debug?.(
+        `flushAcks: paused for ${Math.round((this.ackPauseUntil - Date.now()) / 1000)}s (registry 429 Retry-After)`,
+      );
       return;
     }
-    this.flushingAcks = true;
-    try {
-      const ids = await this.store.drainAcks();
-      if (ids.length === 0) return;
-      // Cap concurrent ack POSTs. A 10k-event backlog after a
-      // restart would otherwise fire 10k simultaneous fetches and
-      // exhaust the local HTTP pool / spike the registry.
-      await withConcurrency(ids, this.ackConcurrency, async (id) => {
-        await this.sendAck(id);
-      });
-    } finally {
-      this.flushingAcks = false;
-    }
+    this.flushAcksPromise = (async () => {
+      try {
+        const ids = await this.store.drainAcks();
+        if (ids.length === 0) return;
+        // Cap concurrent ack POSTs. A 10k-event backlog after a
+        // restart would otherwise fire 10k simultaneous fetches and
+        // exhaust the local HTTP pool / spike the registry.
+        await withConcurrency(
+          ids,
+          this.ackConcurrency,
+          async (id) => {
+            await this.sendAck(id);
+          },
+          // Concurrency-level errors are already individually
+          // logged in sendAck; surface unexpected throws so they
+          // don't silently disappear.
+          (err) => this.logger.warn?.('unexpected error during ack flush', err),
+        );
+      } finally {
+        this.flushAcksPromise = null;
+      }
+    })();
+    return this.flushAcksPromise;
   }
 
   /** 4xx (except 429) is permanent — request itself is bad. Never retry. */
@@ -363,9 +421,23 @@ export class PollingSource implements EventSource {
         );
       } else {
         outcome = 'transient';
-        this.logger.warn?.(
-          `ack for ${eventId} returned HTTP ${response.status}; will retry`,
-        );
+        if (response.status === 429) {
+          // Respect the registry's hint when available. The next drain
+          // tick is the granularity we control — if the suggested delay
+          // is shorter, just take the next tick; otherwise pause future
+          // drains accordingly.
+          const retryAfter = parseRetryAfter(response.headers.get('retry-after'));
+          if (retryAfter !== null) {
+            this.logger.warn?.(
+              `ack for ${eventId} hit 429; honouring Retry-After: ${Math.round(retryAfter / 1000)}s`,
+            );
+            this.ackPauseUntil = Math.max(this.ackPauseUntil, Date.now() + retryAfter);
+          }
+        } else {
+          this.logger.warn?.(
+            `ack for ${eventId} returned HTTP ${response.status}; will retry`,
+          );
+        }
       }
     } catch (err) {
       outcome = 'transient';
@@ -410,4 +482,29 @@ function backoffDelay(attempt: number, baseMs: number, maxMs: number): number {
   const exp = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
   const jitter = exp * 0.25 * Math.random();
   return Math.floor(exp + jitter);
+}
+
+/**
+ * Parses a `Retry-After` header value into milliseconds.
+ *
+ * Accepts both the integer-seconds form (`Retry-After: 30`) and the
+ * HTTP-date form (`Retry-After: Wed, 11 May 2026 17:00:00 GMT`).
+ * Returns null when the header is absent or unparseable.
+ *
+ * The returned delay is clamped to `[0, 1 hour]` so a misbehaving
+ * registry can't pin the client indefinitely.
+ */
+function parseRetryAfter(value: string | null): number | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const seconds = Number.parseInt(trimmed, 10);
+  let ms: number;
+  if (!Number.isNaN(seconds) && /^\d+$/.test(trimmed)) {
+    ms = seconds * 1000;
+  } else {
+    const date = Date.parse(trimmed);
+    if (Number.isNaN(date)) return null;
+    ms = Math.max(0, date - Date.now());
+  }
+  return Math.min(Math.max(ms, 0), 60 * 60 * 1000);
 }

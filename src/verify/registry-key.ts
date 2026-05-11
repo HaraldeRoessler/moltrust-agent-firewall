@@ -184,10 +184,18 @@ function validateJwk(jwk: unknown): asserts jwk is JsonWebKey {
 
 function parseCacheControl(header: string | null, maxTtlMs: number): number {
   if (!header) return DEFAULT_CACHE_TTL_MS;
-  const m = /(?:^|[\s,])max-age\s*=\s*(\d+)/i.exec(header);
+  const lower = header.toLowerCase();
+  // Honour the registry's explicit no-cache directives by collapsing
+  // to the library's floor (we always cache for at least MIN_CACHE_TTL_MS
+  // so a steady-state warm key can still survive a brief 1-second
+  // micro-burst of requests without re-fetching).
+  if (/(?:^|[\s,])(?:no-store|no-cache|must-revalidate)\b/.test(lower)) {
+    return MIN_CACHE_TTL_MS;
+  }
+  const m = /(?:^|[\s,])max-age\s*=\s*(\d+)/.exec(lower);
   if (!m) return DEFAULT_CACHE_TTL_MS;
   const seconds = Number.parseInt(m[1]!, 10);
-  if (!Number.isFinite(seconds) || seconds <= 0) return DEFAULT_CACHE_TTL_MS;
+  if (!Number.isFinite(seconds) || seconds <= 0) return MIN_CACHE_TTL_MS;
   const ms = Math.min(Math.max(seconds * 1000, MIN_CACHE_TTL_MS), maxTtlMs);
   return ms;
 }

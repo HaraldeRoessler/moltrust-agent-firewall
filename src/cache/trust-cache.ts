@@ -62,8 +62,19 @@ export class TrustCache {
     this.entries.delete(did);
   }
 
-  /** Returns the number of entries currently held (including possibly-expired ones; use `get` for live reads). */
+  /**
+   * Returns the number of live (non-expired) entries.
+   *
+   * Sweeps expired entries while counting so metrics built from
+   * this getter never overcount stale ones. The cost is O(n) on
+   * call; cache implementations needing constant-time `size` can
+   * use the in-memory Map directly via composition.
+   */
   get size(): number {
+    const now = this.now();
+    for (const [did, e] of this.entries) {
+      if (e.valid_until.getTime() < now) this.entries.delete(did);
+    }
     return this.entries.size;
   }
 

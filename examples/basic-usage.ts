@@ -55,6 +55,10 @@ async function main(): Promise<void> {
   // Keep running until SIGINT.
   process.on('SIGINT', () => {
     console.log('shutting down…');
+    // Tear down in the right order: detach the gate's listener first,
+    // then stop the client. Without dispose() the gate keeps a
+    // reference to the client and leaks if recreated dynamically.
+    gate.dispose();
     void client.stop().then(() => process.exit(0));
   });
 }

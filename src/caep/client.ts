@@ -21,6 +21,9 @@ const MAX_FLAG_LENGTH = 256;
 /** Minimum interval between distinct fetches for the same DID. */
 const DEFAULT_MIN_FETCH_INTERVAL_MS = 1_000;
 
+/** How often the rate-limiter sweeps stale entries, at most. */
+const LAST_FETCH_SWEEP_INTERVAL_MS = 30_000;
+
 function extractFlag(value: unknown, onTruncated?: (originalLength: number) => void): string {
   if (typeof value !== 'string') return '';
   if (value.length > MAX_FLAG_LENGTH) {
@@ -148,8 +151,12 @@ export class MoltrustCaepClient extends EventEmitter {
   private readonly dropUnsignedEvents: boolean;
   private readonly minFetchIntervalMs: number;
   private readonly inflightFetches = new Map<Did, Promise<VerifiedTrustScore>>();
-  /** Wall-clock ms at which we last (started) a verifier fetch for this DID. */
+  /**
+   * Wall-clock ms at which we last (started) a verifier fetch for this DID.
+   * Lazy-swept on access — see `sweepStaleFetchTimestamps`.
+   */
   private readonly lastFetchAt = new Map<Did, number>();
+  private lastSweepAt = 0;
   private readonly logger: Required<MoltrustCaepClientOptions>['logger'];
   private started = false;
 
@@ -251,16 +258,18 @@ export class MoltrustCaepClient extends EventEmitter {
     // `minFetchIntervalMs` of the previous one. Protects against
     // serial-loop misuse that the singleflight (concurrent dedup)
     // alone cannot catch.
+    const now = Date.now();
     const last = this.lastFetchAt.get(did);
-    if (last !== undefined && Date.now() - last < this.minFetchIntervalMs) {
-      const remaining = this.minFetchIntervalMs - (Date.now() - last);
+    if (last !== undefined && now - last < this.minFetchIntervalMs) {
+      const remaining = this.minFetchIntervalMs - (now - last);
       throw new MoltrustFirewallError(
         `getVerifiedScore for ${did} called within ${remaining}ms of the previous fetch; ` +
           `wait at least ${remaining}ms before retrying (or rely on the cache)`,
         'rate_limited_client',
       );
     }
-    this.lastFetchAt.set(did, Date.now());
+    this.lastFetchAt.set(did, now);
+    this.sweepStaleFetchTimestamps(now);
     const promise = this.verifier
       .fetchAndVerify(did)
       .then((score) => {
@@ -301,6 +310,21 @@ export class MoltrustCaepClient extends EventEmitter {
     ...args: MoltrustCaepClientEvents[K]
   ): boolean {
     return super.emit(event, ...args);
+  }
+
+  /**
+   * Lazily prunes `lastFetchAt` entries older than 2× the rate-limit
+   * window — they no longer constrain anything. Runs at most once
+   * every `LAST_FETCH_SWEEP_INTERVAL_MS`. Bounds memory for long-running
+   * processes watching many distinct DIDs.
+   */
+  private sweepStaleFetchTimestamps(now: number): void {
+    if (now - this.lastSweepAt < LAST_FETCH_SWEEP_INTERVAL_MS) return;
+    this.lastSweepAt = now;
+    const threshold = now - this.minFetchIntervalMs * 2;
+    for (const [did, t] of this.lastFetchAt) {
+      if (t < threshold) this.lastFetchAt.delete(did);
+    }
   }
 
   private async handle(raw: CaepEvent): Promise<void> {

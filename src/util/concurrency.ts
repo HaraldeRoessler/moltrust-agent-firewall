@@ -14,6 +14,7 @@ export async function withConcurrency<T>(
   items: readonly T[],
   limit: number,
   fn: (item: T) => Promise<void>,
+  onError?: (err: unknown, item: T) => void,
 ): Promise<void> {
   if (items.length === 0) return;
   const cap = Math.max(1, Math.min(limit, items.length));
@@ -29,9 +30,18 @@ export async function withConcurrency<T>(
           if (item === undefined) return;
           try {
             await fn(item);
-          } catch {
-            // Per-task errors are non-fatal at the orchestrator
-            // level — callers report via their own logger.
+          } catch (err) {
+            // Per-task errors don't abort the batch (we still want
+            // other items to run). Surface via the optional onError
+            // callback so callers can log; absent that, the error
+            // is swallowed (matching the prior contract).
+            if (onError) {
+              try {
+                onError(err, item);
+              } catch {
+                /* onError itself shouldn't take down the worker */
+              }
+            }
           }
         }
       })(),
