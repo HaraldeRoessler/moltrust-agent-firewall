@@ -6,7 +6,7 @@
  *
  *   npx tsx scripts/smoke-test.ts [did:moltrust:...]
  *
- * Defaults to DSNCON's published DID if no arg is given.
+ * Defaults to a placeholder DID if no arg is given.
  */
 import {
   EnforcementGate,
