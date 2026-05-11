@@ -14,6 +14,14 @@ import { PollingSource, type PollingSourceOptions } from './polling-source.js';
 import type { EventSource } from './source.js';
 import { assertValidDid, validateRegistryUrl } from '../util/security.js';
 
+/** Max bytes for flag payload values — defensive cap against compromised-registry log/memory blowup. */
+const MAX_FLAG_LENGTH = 256;
+
+function extractFlag(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value.slice(0, MAX_FLAG_LENGTH);
+}
+
 /** Strongly-typed event map for `MoltrustCaepClient`. */
 export interface MoltrustCaepClientEvents {
   /** Any CAEP event observed from any source, before per-type fan-out. */
@@ -51,6 +59,17 @@ export interface MoltrustCaepClientOptions {
    * prefer to receive the raw event via `client.on('event', ...)`.
    */
   autoVerify?: boolean;
+  /**
+   * Allow `http://` URLs for the registry. NEVER set in production —
+   * cleartext HTTP would expose DIDs, scores, and any API key in
+   * transit. Local-mock testing only.
+   *
+   * When set at this top level, the flag is propagated consistently
+   * to the internal verifier, registry-key discovery, and polling
+   * source. (You can also set `polling.dangerouslyAllowHttp`, but
+   * mixing the two is discouraged — prefer this top-level option.)
+   */
+  dangerouslyAllowHttp?: boolean;
   /**
    * CAEP profile v1 does NOT sign individual events. `trust_score_change`
    * is safe because the client re-fetches the signed score before
@@ -106,21 +125,27 @@ export class MoltrustCaepClient extends EventEmitter {
 
   constructor(opts: MoltrustCaepClientOptions = {}) {
     super();
+    // Allow either the top-level or polling.* form, defaulting to the
+    // safer (HTTPS-only) value. The top-level flag wins if both are
+    // set, since it's the new canonical surface.
+    const allowHttp =
+      opts.dangerouslyAllowHttp ?? opts.polling?.dangerouslyAllowHttp ?? false;
     const registryUrl = validateRegistryUrl(
       opts.registryUrl ?? DEFAULT_REGISTRY,
-      opts.polling?.dangerouslyAllowHttp ?? false,
+      allowHttp,
     );
     const fetchImpl = opts.fetchImpl ?? fetch;
     for (const did of opts.watch ?? []) assertValidDid(did, 'MoltrustCaepClient.watch');
     this.verifier =
       opts.verifier ??
-      new MoltrustVerifier({ registryUrl, fetchImpl });
+      new MoltrustVerifier({ registryUrl, fetchImpl, dangerouslyAllowHttp: allowHttp });
     this.cache = opts.cache ?? new TrustCache();
     this.source =
       opts.source ??
       new PollingSource({
         registryUrl,
         fetchImpl,
+        dangerouslyAllowHttp: allowHttp,
         ...(opts.watch ? { watch: opts.watch } : {}),
         ...(opts.polling ?? {}),
       });
@@ -254,14 +279,14 @@ export class MoltrustCaepClient extends EventEmitter {
         }
         case 'flag_added': {
           if (!this.dropUnsignedEvents) {
-            const flag = typeof raw.payload['flag'] === 'string' ? raw.payload['flag'] : '';
+            const flag = extractFlag(raw.payload['flag']);
             this.emit('flag_added', raw.subject_did, flag, raw);
           }
           break;
         }
         case 'flag_removed': {
           if (!this.dropUnsignedEvents) {
-            const flag = typeof raw.payload['flag'] === 'string' ? raw.payload['flag'] : '';
+            const flag = extractFlag(raw.payload['flag']);
             this.emit('flag_removed', raw.subject_did, flag, raw);
           }
           break;

@@ -63,7 +63,11 @@ export { EnforcementGate, type GateDecision, type GateOptions } from './firewall
 export {
   assertJsonResponse,
   assertValidDid,
+  DEFAULT_MAX_RESPONSE_BYTES,
   isValidCaepEvent,
   isValidDid,
+  readJsonBoundedBody,
+  sanitiseUrl,
+  summariseCaepEvent,
   validateRegistryUrl,
 } from './util/security.js';

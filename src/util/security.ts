@@ -13,8 +13,12 @@ export function validateRegistryUrl(url: string, allowHttp = false): string {
   try {
     parsed = new URL(url);
   } catch {
+    // Don't reflect the raw input — enterprise registry URLs can
+    // contain internal hostnames and (mis-pasted) credentials. The
+    // caller already knows the value they passed.
+    const safe = typeof url === 'string' ? `(string of length ${url.length})` : `(non-string: ${typeof url})`;
     throw new MoltrustFirewallError(
-      `registryUrl is not a valid URL: '${url}'`,
+      `registryUrl is not a valid URL ${safe}`,
       'invalid_registry_url',
     );
   }
@@ -34,6 +38,26 @@ export function validateRegistryUrl(url: string, allowHttp = false): string {
  * and the did:moltrust → ERC-8004 bridge identifiers the registry exposes,
  * while rejecting empty strings, control characters, embedded URL fragments,
  * and lengths beyond what any sane DID requires (256 chars).
+ *
+ * Library-wide DID-handling policy:
+ *
+ *   1. **Inputs are sanitised in errors.** When validation fails in
+ *      `assertValidDid`, the rejected value is NEVER reflected into
+ *      the error message — only its shape and length. The caller may
+ *      have accidentally passed a credential, PII, or an internal
+ *      identifier that shouldn't bleed into observability pipelines.
+ *
+ *   2. **Validated DIDs ARE public.** Once a string has passed
+ *      `assertValidDid`, it is a syntactically valid DID and is
+ *      treated as public-by-design — DIDs are intended to be shared
+ *      and resolved (e.g. https://moltrust.ch/verify/did:moltrust:...
+ *      is a public web page). Including them in subsequent errors,
+ *      audit logs, and metrics is intentional, not a leak.
+ *
+ *   3. **isValidDid is syntax-only, not normalisation.** Percent
+ *      sequences (e.g. did:web:host%3A8080) are permitted because the
+ *      DID Core spec uses them. Downstream consumers that depend on
+ *      semantic equality should percent-decode before comparison.
  */
 const DID_REGEX = /^did:[a-z0-9]+:[a-zA-Z0-9._:%-]{1,200}$/;
 
@@ -157,10 +181,137 @@ export function assertJsonResponse(response: Response, url: string): void {
   const ct = response.headers.get('content-type') ?? '';
   if (!ct.toLowerCase().includes('application/json')) {
     throw new MoltrustFirewallError(
-      `expected application/json from ${url}, got '${ct || '(none)'}'`,
+      `expected application/json from ${sanitiseUrl(url)}, got '${ct || '(none)'}'`,
       'unexpected_content_type',
     );
   }
+}
+
+/**
+ * Default cap for any response body read by this library. Trust-score
+ * responses are ~500B, JWKs ~250B, and a fully-packed CAEP page
+ * (500 events) maxes out around ~150KB — 1 MiB is several orders of
+ * magnitude above legitimate sizes while staying well clear of a
+ * compromised-registry memory-exhaustion attack.
+ */
+export const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
+
+/**
+ * Reads a Response body with an enforced size cap and parses it as
+ * JSON. Rejects (with `MoltrustFirewallError(code: 'response_too_large')`)
+ * if Content-Length is declared and exceeds `maxBytes`, OR if the
+ * streamed body cumulatively exceeds `maxBytes` mid-read (covers
+ * chunked responses that omit Content-Length).
+ *
+ * Defends against a compromised registry / MITM serving a multi-GB
+ * body that `response.json()` would happily slurp into memory within
+ * the per-request timeout window.
+ */
+export async function readJsonBoundedBody<T>(
+  response: Response,
+  url: string,
+  maxBytes: number = DEFAULT_MAX_RESPONSE_BYTES,
+): Promise<T> {
+  const contentLength = response.headers.get('content-length');
+  if (contentLength) {
+    const declared = Number.parseInt(contentLength, 10);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new MoltrustFirewallError(
+        `response from ${sanitiseUrl(url)} declares Content-Length ${declared} bytes, exceeds cap ${maxBytes}`,
+        'response_too_large',
+      );
+    }
+  }
+  if (!response.body) {
+    // No body — caller-shape problem rather than security one.
+    throw new MoltrustFirewallError(
+      `response from ${sanitiseUrl(url)} has no body`,
+      'empty_body',
+    );
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          /* best-effort */
+        }
+        throw new MoltrustFirewallError(
+          `response body from ${sanitiseUrl(url)} exceeded cap of ${maxBytes} bytes`,
+          'response_too_large',
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* lock may already be released by cancel() */
+    }
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(merged);
+  try {
+    return JSON.parse(text) as T;
+  } catch (err) {
+    throw new MoltrustFirewallError(
+      `response from ${sanitiseUrl(url)} is not valid JSON`,
+      'invalid_json',
+      err,
+    );
+  }
+}
+
+/**
+ * Returns a sanitised representation of a URL for safe inclusion in
+ * error messages and logs. Strips path, query, fragment, and any
+ * userinfo so internal hostnames and credentials don't leak into
+ * observability pipelines.
+ */
+export function sanitiseUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    // Couldn't parse as a URL — show only the leading 40 chars,
+    // ASCII-only, so logs stay grep-friendly without bleeding content.
+    const safe = url.slice(0, 40).replace(/[^\x20-\x7e]/g, '?');
+    return `(unparseable URL: ${safe})`;
+  }
+}
+
+/**
+ * Returns a small, safe summary of a CAEP event for logging when
+ * validation fails. Includes only the canonical envelope fields,
+ * truncated to safe lengths, and reports the value type rather than
+ * the value itself for the payload (which is registry-supplied and
+ * could be log-injection-shaped).
+ */
+export function summariseCaepEvent(raw: unknown): Record<string, string> {
+  const summary: Record<string, string> = { _raw_type: typeof raw };
+  if (!raw || typeof raw !== 'object') return summary;
+  const e = raw as Record<string, unknown>;
+  const truncate = (s: unknown, n: number): string =>
+    typeof s === 'string' ? s.slice(0, n).replace(/[^\x20-\x7e]/g, '?') : `(${typeof s})`;
+  summary['event_id'] = truncate(e['event_id'], 40);
+  summary['event_type'] = truncate(e['event_type'], 40);
+  summary['subject_did'] = truncate(e['subject_did'], 80);
+  summary['emitted_at'] = truncate(e['emitted_at'], 40);
+  summary['payload_type'] = e['payload'] === null ? 'null' : Array.isArray(e['payload']) ? 'array' : typeof e['payload'];
+  return summary;
 }
 
 /** Constructs the Authorization / X-API-Key headers from caller options. */

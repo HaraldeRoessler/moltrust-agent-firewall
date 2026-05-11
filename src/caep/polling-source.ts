@@ -14,6 +14,8 @@ import {
   buildAuthHeaders,
   fetchWithTimeout,
   isValidCaepEvent,
+  readJsonBoundedBody,
+  summariseCaepEvent,
   validateRegistryUrl,
 } from '../util/security.js';
 import type { EventSource } from './source.js';
@@ -247,7 +249,11 @@ export class PollingSource implements EventSource {
       );
     }
     assertJsonResponse(response, url);
-    const body = (await response.json()) as CaepPendingResponse;
+    // 2 MiB cap: a full-page CAEP response (500 events, each
+    // ~300B) fits in well under 200KB. The cap protects against a
+    // compromised registry serving a multi-GB body without
+    // foreclosing on realistic bursts.
+    const body = await readJsonBoundedBody<CaepPendingResponse>(response, url, 2 * 1024 * 1024);
     if (!body || !Array.isArray(body.events)) {
       throw new MoltrustFirewallError(
         'malformed CAEP pending response (missing events array)',
@@ -259,9 +265,13 @@ export class PollingSource implements EventSource {
       if (isValidCaepEvent(raw)) {
         valid.push(raw);
       } else {
+        // Log only a length-capped, non-control-char summary — the
+        // raw event is registry-supplied and could be log-injection-
+        // shaped or megabyte-scale. summariseCaepEvent extracts only
+        // canonical envelope fields with truncation.
         this.logger.warn?.(
-          `dropping malformed CAEP event from /caep/pending/${state.did}`,
-          { raw },
+          `dropping malformed CAEP event from polling source`,
+          summariseCaepEvent(raw),
         );
       }
     }

@@ -14,6 +14,7 @@ import {
   assertValidDid,
   buildAuthHeaders,
   fetchWithTimeout,
+  readJsonBoundedBody,
   validateRegistryUrl,
 } from '../util/security.js';
 
@@ -108,6 +109,10 @@ export class MoltrustVerifier {
       );
     } catch (err) {
       if (err instanceof MoltrustFirewallError) throw err;
+      // DID is included because it's a public-by-design identifier
+      // (mirroring the moltrust.ch /verify/<did> public page); the
+      // raw URL is intentionally not — see sanitiseUrl in
+      // src/util/security.ts for rationale.
       throw new MoltrustFirewallError(
         `failed to fetch trust score for ${did}`,
         'fetch_failed',
@@ -121,16 +126,7 @@ export class MoltrustVerifier {
       );
     }
     assertJsonResponse(response, url);
-    let body: SignedTrustScoreResponse;
-    try {
-      body = (await response.json()) as SignedTrustScoreResponse;
-    } catch (err) {
-      throw new MoltrustFirewallError(
-        'trust score endpoint returned non-JSON',
-        'invalid_json',
-        err,
-      );
-    }
+    const body = await readJsonBoundedBody<SignedTrustScoreResponse>(response, url);
     return this.verifyResponse(body);
   }
 
