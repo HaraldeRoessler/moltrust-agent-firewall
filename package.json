@@ -36,7 +36,8 @@
     "dist",
     "LICENSE",
     "README.md",
-    "PROFILE.md"
+    "PROFILE.md",
+    "SECURITY.md"
   ],
   "engines": {
     "node": ">=18"

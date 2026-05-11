@@ -225,8 +225,11 @@ See the inline TypeScript types for the full surface.
   to verify that a DID was legitimately registered, hit
   `GET /identity/verify/{did}` separately.
 
-Vulnerabilities: please email `security@moltrust.ch` rather than
-opening a public issue.
+**Reporting vulnerabilities:** please use [GitHub's private
+vulnerability reporting](https://github.com/HaraldeRoessler/moltrust-agent-firewall/security/advisories/new)
+rather than a public issue. See [SECURITY.md](./SECURITY.md) for the
+full policy — supported versions, response timeline, disclosure
+window, and scope.
 
 ## License
 
