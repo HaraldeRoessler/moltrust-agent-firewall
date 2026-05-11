@@ -5,16 +5,27 @@ import {
   type JsonWebKey,
   type RegistryKey,
 } from '../types.js';
+import { fetchWithTimeout, validateRegistryUrl } from '../util/security.js';
 
 const MIN_CACHE_TTL_MS = 60_000; // never honour Cache-Control below 60s
 const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000; // 1h fallback
 const MAX_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // hard ceiling: 24h
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 export interface RegistryKeyDiscoveryOptions {
   registryUrl?: string;
   fetchImpl?: typeof fetch;
   /** Override the cache TTL ceiling (defaults to 24h). */
   maxCacheTtlMs?: number;
+  /** Per-request HTTP timeout in ms (default 10s). */
+  requestTimeoutMs?: number;
+  /**
+   * Allow `http://` registry URLs. NEVER set this in production —
+   * cleartext HTTP would expose DIDs, scores, and any API key in
+   * transit. The flag exists only for local development against
+   * a mocked registry.
+   */
+  dangerouslyAllowHttp?: boolean;
 }
 
 /**
@@ -35,11 +46,16 @@ export class RegistryKeyDiscovery {
   private readonly registryUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly maxCacheTtlMs: number;
+  private readonly requestTimeoutMs: number;
 
   constructor(opts: RegistryKeyDiscoveryOptions = {}) {
-    this.registryUrl = (opts.registryUrl ?? DEFAULT_REGISTRY).replace(/\/$/, '');
+    this.registryUrl = validateRegistryUrl(
+      opts.registryUrl ?? DEFAULT_REGISTRY,
+      opts.dangerouslyAllowHttp ?? false,
+    );
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.maxCacheTtlMs = opts.maxCacheTtlMs ?? MAX_CACHE_TTL_MS;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   /**
@@ -83,11 +99,14 @@ export class RegistryKeyDiscovery {
     const url = `${this.registryUrl}/.well-known/registry-key.json`;
     let response: Response;
     try {
-      response = await this.fetchImpl(url, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-      });
+      response = await fetchWithTimeout(
+        this.fetchImpl,
+        url,
+        { method: 'GET', headers: { Accept: 'application/json' } },
+        this.requestTimeoutMs,
+      );
     } catch (err) {
+      if (err instanceof MoltrustFirewallError) throw err;
       throw new MoltrustFirewallError(
         `failed to fetch registry key from ${url}`,
         'fetch_failed',

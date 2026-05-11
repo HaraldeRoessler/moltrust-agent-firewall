@@ -12,6 +12,7 @@ import { MoltrustVerifier } from '../verify/verifier.js';
 import { TrustCache } from '../cache/trust-cache.js';
 import { PollingSource, type PollingSourceOptions } from './polling-source.js';
 import type { EventSource } from './source.js';
+import { assertValidDid, validateRegistryUrl } from '../util/security.js';
 
 /** Strongly-typed event map for `MoltrustCaepClient`. */
 export interface MoltrustCaepClientEvents {
@@ -50,6 +51,25 @@ export interface MoltrustCaepClientOptions {
    * prefer to receive the raw event via `client.on('event', ...)`.
    */
   autoVerify?: boolean;
+  /**
+   * CAEP profile v1 does NOT sign individual events. `trust_score_change`
+   * is safe because the client re-fetches the signed score before
+   * emitting the typed event. `did_revoked`, `flag_added`, and
+   * `flag_removed` are NOT independently verified — a network
+   * attacker between the consumer and the registry could fabricate
+   * them.
+   *
+   * When `dropUnsignedEvents: true`, the typed handlers for those
+   * three event types are suppressed (events still pass through the
+   * generic `'event'` channel for diagnostics, so consumers can
+   * still observe them, just not act on them via the strong-typed
+   * handlers).
+   *
+   * Default: false (events processed as-is). The registry's roadmap
+   * includes signed CAEP envelopes — once shipped, that work will
+   * land here as Profile v2.
+   */
+  dropUnsignedEvents?: boolean;
 }
 
 /**
@@ -74,12 +94,17 @@ export class MoltrustCaepClient extends EventEmitter {
   public readonly cache: TrustCache;
   public readonly source: EventSource;
   private readonly autoVerify: boolean;
+  private readonly dropUnsignedEvents: boolean;
   private started = false;
 
   constructor(opts: MoltrustCaepClientOptions = {}) {
     super();
-    const registryUrl = (opts.registryUrl ?? DEFAULT_REGISTRY).replace(/\/$/, '');
+    const registryUrl = validateRegistryUrl(
+      opts.registryUrl ?? DEFAULT_REGISTRY,
+      opts.polling?.dangerouslyAllowHttp ?? false,
+    );
     const fetchImpl = opts.fetchImpl ?? fetch;
+    for (const did of opts.watch ?? []) assertValidDid(did, 'MoltrustCaepClient.watch');
     this.verifier =
       opts.verifier ??
       new MoltrustVerifier({ registryUrl, fetchImpl });
@@ -93,6 +118,7 @@ export class MoltrustCaepClient extends EventEmitter {
         ...(opts.polling ?? {}),
       });
     this.autoVerify = opts.autoVerify ?? true;
+    this.dropUnsignedEvents = opts.dropUnsignedEvents ?? false;
   }
 
   async start(): Promise<void> {
@@ -109,11 +135,13 @@ export class MoltrustCaepClient extends EventEmitter {
 
   /** Add a DID to the watch set on the underlying source. */
   watch(did: Did): void {
+    assertValidDid(did, 'MoltrustCaepClient.watch');
     this.source.watch(did);
   }
 
   /** Remove a DID from the watch set. */
   unwatch(did: Did): void {
+    assertValidDid(did, 'MoltrustCaepClient.unwatch');
     this.source.unwatch(did);
   }
 
@@ -123,6 +151,7 @@ export class MoltrustCaepClient extends EventEmitter {
    * one (which also populates the cache).
    */
   async getVerifiedScore(did: Did): Promise<VerifiedTrustScore> {
+    assertValidDid(did, 'MoltrustCaepClient.getVerifiedScore');
     const cached = this.cache.get(did);
     if (cached) return cached;
     const fresh = await this.verifier.fetchAndVerify(did);
@@ -174,17 +203,23 @@ export class MoltrustCaepClient extends EventEmitter {
         }
         case 'did_revoked': {
           this.cache.invalidate(raw.subject_did);
-          this.emit('did_revoked', raw.subject_did, raw);
+          if (!this.dropUnsignedEvents) {
+            this.emit('did_revoked', raw.subject_did, raw);
+          }
           break;
         }
         case 'flag_added': {
-          const flag = String(raw.payload.flag ?? '');
-          this.emit('flag_added', raw.subject_did, flag, raw);
+          if (!this.dropUnsignedEvents) {
+            const flag = typeof raw.payload['flag'] === 'string' ? raw.payload['flag'] : '';
+            this.emit('flag_added', raw.subject_did, flag, raw);
+          }
           break;
         }
         case 'flag_removed': {
-          const flag = String(raw.payload.flag ?? '');
-          this.emit('flag_removed', raw.subject_did, flag, raw);
+          if (!this.dropUnsignedEvents) {
+            const flag = typeof raw.payload['flag'] === 'string' ? raw.payload['flag'] : '';
+            this.emit('flag_removed', raw.subject_did, flag, raw);
+          }
           break;
         }
         default:

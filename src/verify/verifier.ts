@@ -9,6 +9,14 @@ import {
 } from '../types.js';
 import { RegistryKeyDiscovery, type RegistryKeyDiscoveryOptions } from './registry-key.js';
 import { trustScoreSigningInput } from './jcs.js';
+import {
+  assertValidDid,
+  buildAuthHeaders,
+  fetchWithTimeout,
+  validateRegistryUrl,
+} from '../util/security.js';
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 export interface VerifierOptions extends RegistryKeyDiscoveryOptions {
   registryUrl?: string;
@@ -19,6 +27,14 @@ export interface VerifierOptions extends RegistryKeyDiscoveryOptions {
    * `expired: true` rather than throwing. Defaults to false (strict).
    */
   allowExpired?: boolean;
+  /** Per-request HTTP timeout in ms (default 10s). */
+  requestTimeoutMs?: number;
+  /** Optional API key sent as `X-API-Key`. Prefer `bearerToken`. */
+  apiKey?: string;
+  /** Optional bearer token sent as `Authorization: Bearer ...` (preferred). */
+  bearerToken?: string;
+  /** Never set in production. See RegistryKeyDiscoveryOptions. */
+  dangerouslyAllowHttp?: boolean;
 }
 
 /**
@@ -42,30 +58,46 @@ export class MoltrustVerifier {
   private readonly fetchImpl: typeof fetch;
   private readonly keyDiscovery: RegistryKeyDiscovery;
   private readonly allowExpired: boolean;
+  private readonly requestTimeoutMs: number;
+  private readonly authHeaders: Record<string, string>;
 
   constructor(opts: VerifierOptions = {}) {
-    this.registryUrl = (opts.registryUrl ?? DEFAULT_REGISTRY).replace(/\/$/, '');
+    this.registryUrl = validateRegistryUrl(
+      opts.registryUrl ?? DEFAULT_REGISTRY,
+      opts.dangerouslyAllowHttp ?? false,
+    );
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.allowExpired = opts.allowExpired ?? false;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const authOpts: { apiKey?: string; bearerToken?: string } = {};
+    if (opts.apiKey !== undefined) authOpts.apiKey = opts.apiKey;
+    if (opts.bearerToken !== undefined) authOpts.bearerToken = opts.bearerToken;
+    this.authHeaders = buildAuthHeaders(authOpts);
     this.keyDiscovery =
       opts.keyDiscovery ??
       new RegistryKeyDiscovery({
         registryUrl: this.registryUrl,
         fetchImpl: this.fetchImpl,
+        requestTimeoutMs: this.requestTimeoutMs,
+        dangerouslyAllowHttp: opts.dangerouslyAllowHttp ?? false,
         ...(opts.maxCacheTtlMs !== undefined ? { maxCacheTtlMs: opts.maxCacheTtlMs } : {}),
       });
   }
 
   /** Convenience: fetch + verify a trust score for a DID. */
   async fetchAndVerify(did: Did): Promise<VerifiedTrustScore> {
+    assertValidDid(did, 'fetchAndVerify');
     const url = `${this.registryUrl}/skill/trust-score/${encodeURIComponent(did)}`;
     let response: Response;
     try {
-      response = await this.fetchImpl(url, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-      });
+      response = await fetchWithTimeout(
+        this.fetchImpl,
+        url,
+        { method: 'GET', headers: { Accept: 'application/json', ...this.authHeaders } },
+        this.requestTimeoutMs,
+      );
     } catch (err) {
+      if (err instanceof MoltrustFirewallError) throw err;
       throw new MoltrustFirewallError(
         `failed to fetch trust score for ${did}`,
         'fetch_failed',

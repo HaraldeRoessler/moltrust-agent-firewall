@@ -64,6 +64,31 @@ All endpoints are on the registry origin (default
 Consumers MUST tolerate unknown `event_type` values without erroring —
 forward compatibility for future types is built in.
 
+### Event authenticity
+
+> **⚠️ Important.** CAEP Profile v1 events are **not individually
+> signed**. The wire format is plain JSON, not a JWS / JWT / SET.
+> Authenticity rests on the TLS channel to `api.moltrust.ch`.
+
+This library handles the gap as follows:
+
+- **`trust_score_change`** is the **only event type that's
+  cryptographically validated end-to-end**. On receipt, the client
+  re-fetches `GET /skill/trust-score/{did}` and runs full
+  JCS + Ed25519 verification before emitting the typed event.
+  A network attacker who fabricates a `trust_score_change` cannot
+  influence the score the caller observes — only trigger an
+  extra signed-score fetch (denial-of-budget concern at most).
+- **`did_revoked`** and **`flag_added` / `flag_removed`** are
+  passed through as received. A compromised proxy between the
+  consumer and the registry could, in principle, fabricate them.
+  Pass `{ dropUnsignedEvents: true }` to `MoltrustCaepClient` to
+  suppress the typed handlers for these event types (they still
+  fire on the generic `'event'` channel for diagnostics).
+- The registry roadmap includes signed CAEP envelopes; once
+  shipped, that work will land here as **Profile v2** with a
+  documented migration path.
+
 ## Signed trust scores
 
 `GET /skill/trust-score/{did}` returns a payload of the form:

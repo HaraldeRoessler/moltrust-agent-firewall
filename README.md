@@ -154,19 +154,53 @@ See the inline TypeScript types for the full surface.
 
 ## Security
 
-This library:
+### Cryptographic posture
 
-- Verifies Ed25519 signatures with [`@noble/curves`](https://github.com/paulmillr/noble-curves)
+- Ed25519 signatures verified with [`@noble/curves`](https://github.com/paulmillr/noble-curves)
   (no native deps, audited).
-- Performs RFC 8785 canonicalisation with [`canonicalize`](https://www.npmjs.com/package/canonicalize).
-- Strictly validates the registry JWK (`kty=OKP`, `crv=Ed25519`,
-  `alg=EdDSA`, 32-byte public key).
-- Clamps cache TTLs to `[60s, 24h]` regardless of upstream
-  `Cache-Control` headers.
-- Honours rate limits — the polling interval is clamped to
-  `>= 30s` per DID.
-- Reports failures via a typed `MoltrustFirewallError` with stable
-  `code` values for telemetry.
+- RFC 8785 canonicalisation via [`canonicalize`](https://www.npmjs.com/package/canonicalize).
+- Strict JWK validation: `kty=OKP`, `crv=Ed25519`, `alg=EdDSA`, 32-byte key.
+- `valid_until` enforced on every signed score (override per-call with `allowExpired: true`).
+- Key-cache TTLs clamped to `[60s, 24h]` regardless of `Cache-Control`.
+
+### Network posture
+
+- **HTTPS required.** `registryUrl` is validated at construction time;
+  HTTP URLs throw `MoltrustFirewallError(code: 'insecure_protocol')`
+  unless `dangerouslyAllowHttp: true` is set (intended for local mocks
+  only).
+- **Per-request timeouts.** All HTTP calls default to a 10s deadline
+  via `AbortSignal.timeout`. Override with `requestTimeoutMs`.
+- **Rate-limit aware.** The polling interval is clamped to `>= 30s`
+  per DID to honour the registry's 120/h-per-DID cap; `429 Retry-After`
+  is obeyed.
+- **DID validation at boundaries.** All public methods that take a DID
+  reject malformed input (length cap 256, `did:method:identifier`
+  syntax) before constructing URLs.
+- **Event shape validation.** Incoming CAEP events are validated
+  against a strict shape before being dispatched; malformed events
+  are dropped with a warning rather than processed.
+
+### Trust-model caveats
+
+- **CAEP events are not signed in v1.** Only `trust_score_change` is
+  validated end-to-end (the client re-fetches the signed score on
+  receipt). For `did_revoked` / `flag_added` / `flag_removed`,
+  authenticity rests on the TLS channel — see [PROFILE.md](./PROFILE.md#event-authenticity)
+  for full details and the `dropUnsignedEvents: true` opt-out.
+- **Authentication credentials are bearer-equivalent.** `apiKey` is
+  sent as `X-API-Key`; the equivalent `bearerToken` option sends
+  `Authorization: Bearer <token>`. Either is the registry's full
+  read credential for the calling agent — treat as a secret, never
+  log, and rotate on suspected exposure.
+- **`EnforcementGate.denylist` is in-memory by default** — it does not
+  survive process restarts. Production deployments wanting durable
+  revocation memory should pass their own `Set` backed by Redis or
+  a DB (the gate mutates the supplied Set in place).
+- **The registry is a trusted upstream.** DID resolution, signup,
+  and registration are all out of scope for this library; if you need
+  to verify that a DID was legitimately registered, hit
+  `GET /identity/verify/{did}` separately.
 
 Vulnerabilities: please email `security@moltrust.ch` rather than
 opening a public issue.

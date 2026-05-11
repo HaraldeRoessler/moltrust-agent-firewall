@@ -8,6 +8,13 @@ import {
   type Store,
 } from '../types.js';
 import { MemoryStore } from '../cache/memory-store.js';
+import {
+  assertValidDid,
+  buildAuthHeaders,
+  fetchWithTimeout,
+  isValidCaepEvent,
+  validateRegistryUrl,
+} from '../util/security.js';
 import type { EventSource } from './source.js';
 
 export interface PollingSourceOptions {
@@ -29,8 +36,20 @@ export interface PollingSourceOptions {
   pageLimit?: number;
   /** Cap on consecutive failures before a DID's poller backs off to `maxBackoffMs`. */
   maxBackoffMs?: number;
-  /** Optional API key sent as `X-API-Key` (some registry deployments require it). */
+  /** Per-request HTTP timeout in ms (default 10s). */
+  requestTimeoutMs?: number;
+  /**
+   * Optional API key sent as `X-API-Key`. Prefer `bearerToken` for
+   * Authorization: Bearer style. Mutually exclusive — `bearerToken` wins.
+   */
   apiKey?: string;
+  /** Optional bearer token sent as `Authorization: Bearer ...`. */
+  bearerToken?: string;
+  /**
+   * Allow http:// registry URLs. NEVER use in production — would
+   * expose DIDs, scores, and any API key in transit. Local testing only.
+   */
+  dangerouslyAllowHttp?: boolean;
   /** Optional console-style logger for non-fatal events (default: silent). */
   logger?: { warn?(msg: string, ...meta: unknown[]): void; debug?(msg: string, ...meta: unknown[]): void };
 }
@@ -41,6 +60,7 @@ const DEFAULT_MAX_BACKOFF_MS = 15 * 60 * 1000;
 const ACK_DRAIN_INTERVAL_MS = 5_000;
 const MAX_PAGE_LIMIT = 500;
 const DEFAULT_PAGE_LIMIT = 100;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 interface PerDidState {
   did: Did;
@@ -68,6 +88,7 @@ export class PollingSource implements EventSource {
   private readonly intervalMs: number;
   private readonly pageLimit: number;
   private readonly maxBackoffMs: number;
+  private readonly requestTimeoutMs: number;
   private readonly headers: Record<string, string>;
   private readonly logger: Required<PollingSourceOptions>['logger'];
   private readonly states = new Map<Did, PerDidState>();
@@ -77,19 +98,29 @@ export class PollingSource implements EventSource {
   private stopped = false;
 
   constructor(opts: PollingSourceOptions = {}) {
-    this.registryUrl = (opts.registryUrl ?? DEFAULT_REGISTRY).replace(/\/$/, '');
+    this.registryUrl = validateRegistryUrl(
+      opts.registryUrl ?? DEFAULT_REGISTRY,
+      opts.dangerouslyAllowHttp ?? false,
+    );
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.store = opts.store ?? new MemoryStore();
     const requested = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.intervalMs = Math.max(MIN_INTERVAL_MS, requested);
     this.pageLimit = clamp(opts.pageLimit ?? DEFAULT_PAGE_LIMIT, 1, MAX_PAGE_LIMIT);
     this.maxBackoffMs = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const authOpts: { apiKey?: string; bearerToken?: string } = {};
+    if (opts.apiKey !== undefined) authOpts.apiKey = opts.apiKey;
+    if (opts.bearerToken !== undefined) authOpts.bearerToken = opts.bearerToken;
     this.headers = {
       Accept: 'application/json',
-      ...(opts.apiKey ? { 'X-API-Key': opts.apiKey } : {}),
+      ...buildAuthHeaders(authOpts),
     };
     this.logger = opts.logger ?? {};
-    for (const did of opts.watch ?? []) this.states.set(did, makeState(did));
+    for (const did of opts.watch ?? []) {
+      assertValidDid(did, 'PollingSource.watch');
+      this.states.set(did, makeState(did));
+    }
   }
 
   async start(onEvent: (event: CaepEvent) => void | Promise<void>): Promise<void> {
@@ -108,6 +139,7 @@ export class PollingSource implements EventSource {
   }
 
   watch(did: Did): void {
+    assertValidDid(did, 'PollingSource.watch');
     if (this.states.has(did)) return;
     const state = makeState(did);
     this.states.set(did, state);
@@ -188,11 +220,12 @@ export class PollingSource implements EventSource {
     state.inflight = ac;
     let response: Response;
     try {
-      response = await this.fetchImpl(url, {
-        method: 'GET',
-        headers: this.headers,
-        signal: ac.signal,
-      });
+      response = await fetchWithTimeout(
+        this.fetchImpl,
+        url,
+        { method: 'GET', headers: this.headers, signal: ac.signal },
+        this.requestTimeoutMs,
+      );
     } finally {
       state.inflight = null;
     }
@@ -218,7 +251,18 @@ export class PollingSource implements EventSource {
         'malformed_response',
       );
     }
-    return body.events;
+    const valid: CaepEvent[] = [];
+    for (const raw of body.events) {
+      if (isValidCaepEvent(raw)) {
+        valid.push(raw);
+      } else {
+        this.logger.warn?.(
+          `dropping malformed CAEP event from /caep/pending/${state.did}`,
+          { raw },
+        );
+      }
+    }
+    return valid;
   }
 
   private async flushAcks(): Promise<void> {
@@ -228,12 +272,18 @@ export class PollingSource implements EventSource {
   }
 
   private async sendAck(eventId: string): Promise<void> {
+    if (!eventId || typeof eventId !== 'string' || eventId.length > 256) {
+      this.logger.warn?.(`refusing to ack malformed event id`);
+      return;
+    }
     const url = `${this.registryUrl}/caep/acknowledge/${encodeURIComponent(eventId)}`;
     try {
-      const response = await this.fetchImpl(url, {
-        method: 'POST',
-        headers: this.headers,
-      });
+      const response = await fetchWithTimeout(
+        this.fetchImpl,
+        url,
+        { method: 'POST', headers: this.headers },
+        this.requestTimeoutMs,
+      );
       if (!response.ok) {
         // Re-queue and let the next drain retry; the registry holds events for 90d.
         await this.store.enqueueAck(eventId);

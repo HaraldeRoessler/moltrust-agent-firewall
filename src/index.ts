@@ -44,3 +44,10 @@ export {
 } from './caep/client.js';
 
 export { EnforcementGate, type GateDecision, type GateOptions } from './firewall/gate.js';
+
+export {
+  assertValidDid,
+  isValidCaepEvent,
+  isValidDid,
+  validateRegistryUrl,
+} from './util/security.js';

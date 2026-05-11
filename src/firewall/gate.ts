@@ -1,5 +1,6 @@
 import type { Did, VerifiedTrustScore } from '../types.js';
 import type { MoltrustCaepClient } from '../caep/client.js';
+import { assertValidDid } from '../util/security.js';
 
 export interface GateDecision {
   allow: boolean;
@@ -22,8 +23,14 @@ export interface GateOptions {
   rejectWithheld?: boolean;
   /**
    * DIDs explicitly denied — typically populated by listening to
-   * `client.on('did_revoked', ...)`. Pass your own Set if you want
-   * to share state across gate instances.
+   * `client.on('did_revoked', ...)`. The default value is a fresh
+   * in-memory `Set` which **does NOT survive process restarts**;
+   * after a restart, previously-revoked DIDs are re-evaluated via
+   * `getVerifiedScore()`.
+   *
+   * For deployments that require persistent denylists (HA gateways,
+   * regulated environments), pass your own Set that's backed by
+   * Redis / DB / disk and the gate will mutate it in place.
    */
   denylist?: Set<Did>;
 }
@@ -58,16 +65,19 @@ export class EnforcementGate {
 
   /** Manually mark a DID as denied (e.g. operator action). */
   deny(did: Did): void {
+    assertValidDid(did, 'EnforcementGate.deny');
     this.denylist.add(did);
   }
 
   /** Remove a DID from the denylist. */
   allowAgain(did: Did): void {
+    assertValidDid(did, 'EnforcementGate.allowAgain');
     this.denylist.delete(did);
   }
 
   /** Returns the gate decision for a single DID. */
   async decide(did: Did): Promise<GateDecision> {
+    assertValidDid(did, 'EnforcementGate.decide');
     if (this.denylist.has(did)) {
       return { allow: false, reason: 'denied_revoked', score: null };
     }
