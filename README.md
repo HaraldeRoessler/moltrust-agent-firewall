@@ -196,9 +196,13 @@ See the inline TypeScript types for the full surface.
   read credential for the calling agent — treat as a secret, never
   log, and rotate on suspected exposure.
 - **`EnforcementGate.denylist` is in-memory by default** — it does not
-  survive process restarts. Production deployments wanting durable
-  revocation memory should pass their own `Set` backed by Redis or
-  a DB (the gate mutates the supplied Set in place).
+  survive process restarts. The default Set is FIFO-capped at
+  `maxDenylistSize` (100_000) to prevent unbounded growth on a
+  steady stream of revocations; the oldest revocation is evicted
+  first. Production deployments wanting durable revocation memory
+  or different eviction semantics should pass their own `Set` backed
+  by Redis / a DB (the gate mutates the supplied Set in place and
+  does NOT enforce the cap on caller-owned Sets).
 - **`MemoryStore` (the default cursor backend) is also in-memory.**
   After a process restart the polling client re-fetches anything
   still in the registry's 90-day retention window for every watched

@@ -46,6 +46,16 @@ export interface GateOptions {
    */
   denylist?: Set<Did>;
   /**
+   * Maximum number of DIDs the (default in-memory) denylist may hold.
+   * When exceeded, the oldest-inserted entry is evicted FIFO. Defaults
+   * to 100_000.
+   *
+   * Has NO effect when you pass your own `denylist` Set — that's
+   * yours to manage. The cap only protects the default in-memory
+   * implementation from unbounded growth on a stream of revocations.
+   */
+  maxDenylistSize?: number;
+  /**
    * When `getVerifiedScore` fails for a transient reason (network
    * failure, timeout, registry 5xx, rate limit), should the gate
    * fail open (allow) or fail closed (deny)?
@@ -78,6 +88,13 @@ export class EnforcementGate {
   private readonly minScore: number;
   private readonly rejectWithheld: boolean;
   private readonly denylist: Set<Did>;
+  private readonly maxDenylistSize: number;
+  /**
+   * Whether the gate owns its denylist (and may therefore enforce
+   * the size cap). When the operator passes their own Set we treat
+   * it as caller-managed and don't evict from it.
+   */
+  private readonly ownsDenylist: boolean;
   private readonly transientErrorPolicy: 'allow' | 'deny';
   /** Bound listener kept so `dispose()` can detach it cleanly. */
   private readonly onRevoked: (did: Did) => void;
@@ -95,7 +112,16 @@ export class EnforcementGate {
     }
     this.minScore = minScore;
     this.rejectWithheld = opts.rejectWithheld ?? true;
+    this.ownsDenylist = opts.denylist === undefined;
     this.denylist = opts.denylist ?? new Set();
+    const cap = opts.maxDenylistSize ?? 100_000;
+    if (!Number.isFinite(cap) || cap < 1) {
+      throw new MoltrustFirewallError(
+        `maxDenylistSize must be a finite integer >= 1 (got ${cap})`,
+        'invalid_max_denylist_size',
+      );
+    }
+    this.maxDenylistSize = cap;
     this.transientErrorPolicy = opts.transientErrorPolicy ?? 'deny';
     // NOTE: the client defaults to dropUnsignedEvents=true, which means
     // did_revoked typed handlers are not invoked unless the operator
@@ -104,9 +130,25 @@ export class EnforcementGate {
     // /skill/trust-score lookup. Document this trade-off so an operator
     // doesn't expect denylist auto-population in the default config.
     this.onRevoked = (did) => {
-      this.denylist.add(did);
+      this.addToDenylist(did);
     };
     client.on('did_revoked', this.onRevoked);
+  }
+
+  /**
+   * Adds a DID to the denylist, evicting the oldest entry first if
+   * the cap is reached. Only enforces the cap on the library-owned
+   * default Set — caller-supplied Sets are mutated as-is and the
+   * cap is the caller's concern.
+   */
+  private addToDenylist(did: Did): void {
+    if (this.denylist.has(did)) return;
+    if (this.ownsDenylist && this.denylist.size >= this.maxDenylistSize) {
+      // Set preserves insertion order; the first entry is the oldest.
+      const oldest = this.denylist.values().next().value;
+      if (oldest !== undefined) this.denylist.delete(oldest);
+    }
+    this.denylist.add(did);
   }
 
   /**
@@ -123,7 +165,7 @@ export class EnforcementGate {
   /** Manually mark a DID as denied (e.g. operator action). */
   deny(did: Did): void {
     assertValidDid(did, 'EnforcementGate.deny');
-    this.denylist.add(did);
+    this.addToDenylist(did);
   }
 
   /** Remove a DID from the denylist. */

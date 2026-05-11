@@ -122,19 +122,30 @@ export function isValidCaepEvent(raw: unknown): raw is CaepEvent {
 export function combineSignals(signals: AbortSignal[]): AbortSignal {
   const native = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
   if (typeof native === 'function') return native(signals);
+  // Node <20.3 fallback. Track attached listeners so the FIRST abort
+  // removes them from ALL input signals — otherwise a long-lived
+  // caller signal accumulates one dangling listener per
+  // fetchWithTimeout call.
   const controller = new AbortController();
+  const handlers: Array<{ signal: AbortSignal; fn: () => void }> = [];
+  const cleanup = (): void => {
+    for (const { signal, fn } of handlers) {
+      signal.removeEventListener('abort', fn);
+    }
+    handlers.length = 0;
+  };
   for (const signal of signals) {
     if (signal.aborted) {
       controller.abort(signal.reason);
+      cleanup();
       return controller.signal;
     }
-    signal.addEventListener(
-      'abort',
-      () => {
-        controller.abort(signal.reason);
-      },
-      { once: true },
-    );
+    const fn = (): void => {
+      controller.abort(signal.reason);
+      cleanup();
+    };
+    signal.addEventListener('abort', fn);
+    handlers.push({ signal, fn });
   }
   return controller.signal;
 }
@@ -158,15 +169,30 @@ export async function fetchWithTimeout(
   } catch (err) {
     // Normalise the "request timed out" error to a stable shape so
     // callers can match on `code === 'request_timeout'`.
-    if (timeoutSignal.aborted && !init.signal?.aborted) {
+    //
+    // Use the error itself (or its cause) as the source of truth
+    // rather than reading signal state — when both the caller signal
+    // AND the timeout signal abort at the same moment, `init.signal.aborted`
+    // can race ahead before we read it, causing a misclassification.
+    // AbortSignal.timeout produces an error/reason whose `name` is
+    // `TimeoutError`; check for that explicitly.
+    if (isTimeoutError(err) || timeoutSignal.reason === (err as { cause?: unknown })?.cause) {
       throw new MoltrustFirewallError(
-        `request to ${url} timed out after ${timeoutMs}ms`,
+        `request to ${sanitiseUrl(url)} timed out after ${timeoutMs}ms`,
         'request_timeout',
         err,
       );
     }
     throw err;
   }
+}
+
+function isTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: unknown; cause?: { name?: unknown } };
+  if (e.name === 'TimeoutError') return true;
+  if (e.cause && typeof e.cause === 'object' && e.cause.name === 'TimeoutError') return true;
+  return false;
 }
 
 /**

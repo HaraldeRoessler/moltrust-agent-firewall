@@ -247,11 +247,19 @@ export class PollingSource implements EventSource {
   }
 
   private async tick(state: PerDidState): Promise<void> {
-    if (this.stopped || !this.onEvent) return;
-    if (!this.states.has(state.did)) return; // unwatched during the sleep
+    if (this.stopped || !this.onEvent || !this.states.has(state.did)) return;
+    // Allocate the AbortController BEFORE any await so `stop()` /
+    // `unwatch()` can cancel this tick mid-flight, even during the
+    // getCursor() round-trip.
+    const ac = new AbortController();
+    state.inflight = ac;
     try {
       const cursor = await this.store.getCursor(state.did);
-      const events = await this.poll(state, cursor);
+      // Re-check shutdown/unwatch after every await — the orchestrator
+      // may have transitioned state during the store I/O above.
+      if (this.stopped || !this.onEvent || !this.states.has(state.did) || ac.signal.aborted) return;
+      const events = await this.poll(state, cursor, ac);
+      if (this.stopped || !this.onEvent || !this.states.has(state.did) || ac.signal.aborted) return;
       for (const evt of events) {
         try {
           await this.onEvent(evt);
@@ -261,6 +269,7 @@ export class PollingSource implements EventSource {
         }
         await this.store.enqueueAck(evt.event_id);
         await this.store.setCursor(state.did, evt.event_id);
+        if (this.stopped || !this.states.has(state.did)) return;
       }
       state.consecutiveFailures = 0;
       this.schedule(state, this.intervalMs);
@@ -288,13 +297,11 @@ export class PollingSource implements EventSource {
     }
   }
 
-  private async poll(state: PerDidState, cursor: string | null): Promise<CaepEvent[]> {
+  private async poll(state: PerDidState, cursor: string | null, ac: AbortController): Promise<CaepEvent[]> {
     const params = new URLSearchParams();
     params.set('limit', String(this.pageLimit));
     if (cursor) params.set('since', cursor);
     const url = `${this.registryUrl}/caep/pending/${encodeURIComponent(state.did)}?${params.toString()}`;
-    const ac = new AbortController();
-    state.inflight = ac;
     let response: Response;
     try {
       response = await fetchWithTimeout(
@@ -487,24 +494,40 @@ function backoffDelay(attempt: number, baseMs: number, maxMs: number): number {
 /**
  * Parses a `Retry-After` header value into milliseconds.
  *
- * Accepts both the integer-seconds form (`Retry-After: 30`) and the
- * HTTP-date form (`Retry-After: Wed, 11 May 2026 17:00:00 GMT`).
- * Returns null when the header is absent or unparseable.
+ * Accepts:
+ *   - delta-seconds: `Retry-After: 30`
+ *   - RFC 7231 IMF-fixdate: `Retry-After: Wed, 11 May 2026 17:00:00 GMT`
  *
- * The returned delay is clamped to `[0, 1 hour]` so a misbehaving
- * registry can't pin the client indefinitely.
+ * Older HTTP-date formats (RFC 850, asctime) are rejected — they
+ * exist in the spec but are nominally obsolete, and `Date.parse`'s
+ * willingness to accept formats like `"tomorrow"` or `"05-11-2026"`
+ * could otherwise let a misbehaving registry pin the client for
+ * an extended (but still clamped) window.
+ *
+ * The returned delay is clamped to `[0, 1 hour]` regardless.
  */
 function parseRetryAfter(value: string | null): number | null {
   if (!value) return null;
   const trimmed = value.trim();
-  const seconds = Number.parseInt(trimmed, 10);
   let ms: number;
-  if (!Number.isNaN(seconds) && /^\d+$/.test(trimmed)) {
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(seconds)) return null;
     ms = seconds * 1000;
-  } else {
+  } else if (IMF_FIXDATE_REGEX.test(trimmed)) {
     const date = Date.parse(trimmed);
     if (Number.isNaN(date)) return null;
     ms = Math.max(0, date - Date.now());
+  } else {
+    return null;
   }
   return Math.min(Math.max(ms, 0), 60 * 60 * 1000);
 }
+
+/**
+ * Strict RFC 7231 IMF-fixdate matcher. Format:
+ *   Sun, 06 Nov 1994 08:49:37 GMT
+ * Day name + 2-digit day + 3-letter month + 4-digit year + HH:MM:SS GMT.
+ */
+const IMF_FIXDATE_REGEX =
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
