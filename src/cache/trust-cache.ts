@@ -1,4 +1,4 @@
-import type { Did, VerifiedTrustScore } from '../types.js';
+import { MoltrustFirewallError, type Did, type VerifiedTrustScore } from '../types.js';
 
 /**
  * In-memory cache of verified trust scores keyed by DID.
@@ -22,7 +22,14 @@ export class TrustCache {
   private readonly now: () => number;
 
   constructor(opts: TrustCacheOptions = {}) {
-    this.maxEntries = opts.maxEntries ?? 10_000;
+    const maxEntries = opts.maxEntries ?? 10_000;
+    if (!Number.isFinite(maxEntries) || maxEntries < 1) {
+      throw new MoltrustFirewallError(
+        `maxEntries must be a finite integer >= 1 (got ${maxEntries})`,
+        'invalid_max_entries',
+      );
+    }
+    this.maxEntries = maxEntries;
     this.now = opts.now ?? (() => Date.now());
   }
 

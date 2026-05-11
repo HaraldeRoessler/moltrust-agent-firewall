@@ -103,9 +103,9 @@ export function isValidCaepEvent(raw: unknown): raw is CaepEvent {
   if (typeof e.event_type !== 'string' || e.event_type.length === 0 || e.event_type.length > 64) {
     return false;
   }
-  if (typeof e.emitted_at !== 'string') return false;
-  const ts = Date.parse(e.emitted_at);
-  if (Number.isNaN(ts)) return false;
+  // Strict ISO 8601 — rejects ambiguous formats like "05-11-2026"
+  // that Date.parse would happily accept with locale-dependent semantics.
+  if (!isStrictIso8601(e.emitted_at)) return false;
   if (e.payload === null || typeof e.payload !== 'object' || Array.isArray(e.payload)) {
     return false;
   }
@@ -176,15 +176,60 @@ export async function fetchWithTimeout(
  * text/html / text/javascript that `response.json()` would happily
  * try to parse, masking an unexpected content path or making
  * any reflected body harder to reason about.
+ *
+ * Uses strict parsing — splits on `;` so the media-type comes out
+ * clean of `charset=...` params, lowercases, and requires an exact
+ * match against `application/json`. Rejects sneaky variants like
+ * `text/html; application/json`, `application/jsonp`, and
+ * `text/application/json-ish`.
  */
 export function assertJsonResponse(response: Response, url: string): void {
-  const ct = response.headers.get('content-type') ?? '';
-  if (!ct.toLowerCase().includes('application/json')) {
+  const raw = response.headers.get('content-type') ?? '';
+  const mediaType = raw.split(';')[0]?.trim().toLowerCase() ?? '';
+  if (mediaType !== 'application/json') {
     throw new MoltrustFirewallError(
-      `expected application/json from ${sanitiseUrl(url)}, got '${ct || '(none)'}'`,
+      `expected application/json from ${sanitiseUrl(url)}, got '${raw || '(none)'}'`,
       'unexpected_content_type',
     );
   }
+}
+
+/**
+ * RFC 7515 base64url decode (no padding, `-` / `_` alphabet).
+ *
+ * Validates the alphabet BEFORE calling `Buffer.from(..., 'base64')`,
+ * which silently ignores invalid characters and would otherwise turn
+ * a corrupted input into a too-short Uint8Array detected only by
+ * downstream length checks.
+ */
+export function base64UrlDecode(s: string): Uint8Array {
+  if (typeof s !== 'string') {
+    throw new MoltrustFirewallError(
+      `expected base64url string, got ${typeof s}`,
+      'invalid_base64url',
+    );
+  }
+  // Normalise: pad, swap to standard base64 alphabet.
+  const pad = s.length % 4;
+  const padded = pad ? s + '='.repeat(4 - pad) : s;
+  const std = padded.replace(/-/g, '+').replace(/_/g, '/');
+  if (!/^[A-Za-z0-9+/=]*$/.test(std)) {
+    throw new MoltrustFirewallError(
+      'value is not valid base64url',
+      'invalid_base64url',
+    );
+  }
+  return new Uint8Array(Buffer.from(std, 'base64'));
+}
+
+/** Strict ISO 8601 date-time check — rejects `Date.parse`'s lenient fallback formats. */
+const ISO_8601_REGEX =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/;
+
+export function isStrictIso8601(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  if (!ISO_8601_REGEX.test(value)) return false;
+  return !Number.isNaN(Date.parse(value));
 }
 
 /**
@@ -314,13 +359,68 @@ export function summariseCaepEvent(raw: unknown): Record<string, string> {
   return summary;
 }
 
-/** Constructs the Authorization / X-API-Key headers from caller options. */
+/**
+ * Constructs the `Authorization` / `X-API-Key` headers from caller options.
+ *
+ * Validates credential shape so misconfigurations surface at construction
+ * time (clear error code) rather than as opaque 401s at first call. Also
+ * rejects values containing characters that would break HTTP header
+ * framing (newlines, control chars).
+ *
+ * `bearerToken` takes precedence when both are set.
+ */
 export function buildAuthHeaders(opts: { apiKey?: string; bearerToken?: string }): Record<string, string> {
   const headers: Record<string, string> = {};
-  if (opts.bearerToken) {
+  if (opts.bearerToken !== undefined) {
+    assertHeaderSafeCredential(opts.bearerToken, 'bearerToken');
     headers['Authorization'] = `Bearer ${opts.bearerToken}`;
-  } else if (opts.apiKey) {
+  } else if (opts.apiKey !== undefined) {
+    assertHeaderSafeCredential(opts.apiKey, 'apiKey');
     headers['X-API-Key'] = opts.apiKey;
   }
   return headers;
 }
+
+const HEADER_INJECTION_REGEX = /[\r\n\0]/;
+
+function assertHeaderSafeCredential(value: unknown, name: string): asserts value is string {
+  if (typeof value !== 'string') {
+    throw new MoltrustFirewallError(
+      `${name} must be a string`,
+      'invalid_auth_credential',
+    );
+  }
+  if (value.length < 8) {
+    throw new MoltrustFirewallError(
+      `${name} is too short (got ${value.length} chars, minimum 8)`,
+      'invalid_auth_credential',
+    );
+  }
+  if (value.length > 1024) {
+    throw new MoltrustFirewallError(
+      `${name} is too long (max 1024 chars)`,
+      'invalid_auth_credential',
+    );
+  }
+  if (HEADER_INJECTION_REGEX.test(value)) {
+    throw new MoltrustFirewallError(
+      `${name} contains illegal characters (newline / NUL)`,
+      'invalid_auth_credential',
+    );
+  }
+}
+
+/**
+ * Standard headers (Accept + User-Agent) every outbound request from this
+ * library should carry. Identifies traffic in registry logs and helps
+ * operators correlate library-originated calls.
+ */
+export function defaultRequestHeaders(): Record<string, string> {
+  return {
+    Accept: 'application/json',
+    'User-Agent': USER_AGENT,
+  };
+}
+
+/** Library identifier surfaced to the registry via User-Agent. */
+export const USER_AGENT = '@moltrust/agent-firewall/1.0.0';

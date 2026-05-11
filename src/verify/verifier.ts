@@ -13,7 +13,9 @@ import { jcsCanonicalize } from './jcs.js';
 import {
   assertJsonResponse,
   assertValidDid,
+  base64UrlDecode,
   buildAuthHeaders,
+  defaultRequestHeaders,
   fetchWithTimeout,
   readJsonBoundedBody,
   validateRegistryUrl,
@@ -105,7 +107,7 @@ export class MoltrustVerifier {
       response = await fetchWithTimeout(
         this.fetchImpl,
         url,
-        { method: 'GET', headers: { Accept: 'application/json', ...this.authHeaders } },
+        { method: 'GET', headers: { ...defaultRequestHeaders(), ...this.authHeaders } },
         this.requestTimeoutMs,
       );
     } catch (err) {
@@ -247,18 +249,3 @@ export class MoltrustVerifier {
   }
 }
 
-/** RFC 7515 base64url decode (no padding, '-' / '_' alphabet). */
-function base64UrlDecode(s: string): Uint8Array {
-  // Normalise: pad, swap to standard base64 alphabet.
-  const pad = s.length % 4;
-  const padded = pad ? s + '='.repeat(4 - pad) : s;
-  const std = padded.replace(/-/g, '+').replace(/_/g, '/');
-  // Refuse anything that's clearly not base64 alphabet at all.
-  if (!/^[A-Za-z0-9+/=]*$/.test(std)) {
-    throw new MoltrustFirewallError(
-      'registry_signature is not valid base64url',
-      'invalid_signature_encoding',
-    );
-  }
-  return new Uint8Array(Buffer.from(std, 'base64'));
-}

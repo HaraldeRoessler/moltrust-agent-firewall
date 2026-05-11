@@ -12,12 +12,14 @@ import {
   assertJsonResponse,
   assertValidDid,
   buildAuthHeaders,
+  defaultRequestHeaders,
   fetchWithTimeout,
   isValidCaepEvent,
   readJsonBoundedBody,
   summariseCaepEvent,
   validateRegistryUrl,
 } from '../util/security.js';
+import { withConcurrency } from '../util/concurrency.js';
 import type { EventSource } from './source.js';
 
 export interface PollingSourceOptions {
@@ -41,6 +43,14 @@ export interface PollingSourceOptions {
   maxBackoffMs?: number;
   /** Per-request HTTP timeout in ms (default 10s). */
   requestTimeoutMs?: number;
+  /** Max concurrent ack POSTs per flush cycle (default 10). */
+  ackConcurrency?: number;
+  /**
+   * Max times a failed ack is re-queued before being dropped (default 5).
+   * Dropping is safe — acks are best-effort; the registry retains events
+   * for 90 days, and the polling cursor has already advanced past them.
+   */
+  maxAckRetries?: number;
   /**
    * Optional API key sent as `X-API-Key`. Prefer `bearerToken` for
    * Authorization: Bearer style. Mutually exclusive — `bearerToken` wins.
@@ -64,6 +74,8 @@ const ACK_DRAIN_INTERVAL_MS = 5_000;
 const MAX_PAGE_LIMIT = 500;
 const DEFAULT_PAGE_LIMIT = 100;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_ACK_CONCURRENCY = 10;
+const DEFAULT_MAX_ACK_RETRIES = 5;
 
 interface PerDidState {
   did: Did;
@@ -92,6 +104,10 @@ export class PollingSource implements EventSource {
   private readonly pageLimit: number;
   private readonly maxBackoffMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly ackConcurrency: number;
+  private readonly maxAckRetries: number;
+  /** event_id → retry attempts so far. Capped by `maxAckRetries`. */
+  private readonly ackRetries = new Map<string, number>();
   private readonly headers: Record<string, string>;
   private readonly logger: Required<PollingSourceOptions>['logger'];
   private readonly states = new Map<Did, PerDidState>();
@@ -113,11 +129,13 @@ export class PollingSource implements EventSource {
     this.pageLimit = clamp(opts.pageLimit ?? DEFAULT_PAGE_LIMIT, 1, MAX_PAGE_LIMIT);
     this.maxBackoffMs = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.ackConcurrency = Math.max(1, opts.ackConcurrency ?? DEFAULT_ACK_CONCURRENCY);
+    this.maxAckRetries = Math.max(0, opts.maxAckRetries ?? DEFAULT_MAX_ACK_RETRIES);
     const authOpts: { apiKey?: string; bearerToken?: string } = {};
     if (opts.apiKey !== undefined) authOpts.apiKey = opts.apiKey;
     if (opts.bearerToken !== undefined) authOpts.bearerToken = opts.bearerToken;
     this.headers = {
-      Accept: 'application/json',
+      ...defaultRequestHeaders(),
       ...buildAuthHeaders(authOpts),
     };
     this.logger = opts.logger ?? {};
@@ -205,6 +223,19 @@ export class PollingSource implements EventSource {
       state.consecutiveFailures = 0;
       this.schedule(state, this.intervalMs);
     } catch (err) {
+      // Permanent HTTP errors (4xx other than 429) won't get better by
+      // retrying. Stop polling this DID and log loudly so an operator
+      // can intervene (unwatch / re-register / fix the API key / etc.).
+      const e = err as { code?: string };
+      if (e.code === 'http_permanent_error') {
+        this.logger.warn?.(
+          `polling for ${state.did} hit a permanent HTTP error; unwatching ` +
+            `(re-call .watch() after fixing the underlying issue)`,
+          err,
+        );
+        this.unwatch(state.did);
+        return;
+      }
       state.consecutiveFailures += 1;
       const delay = backoffDelay(state.consecutiveFailures, this.intervalMs, this.maxBackoffMs);
       this.logger.warn?.(
@@ -243,9 +274,14 @@ export class PollingSource implements EventSource {
       );
     }
     if (!response.ok) {
+      // 4xx (except 429) means the request itself is bad — DID not
+      // registered, malformed cursor, auth issue. No amount of
+      // retrying will fix it. Surface a different code so the
+      // poll loop can stop wasting cycles on this DID.
+      const code = response.status >= 400 && response.status < 500 ? 'http_permanent_error' : 'http_error';
       throw new MoltrustFirewallError(
         `GET /caep/pending/${state.did} returned HTTP ${response.status}`,
-        'http_error',
+        code,
       );
     }
     assertJsonResponse(response, url);
@@ -279,26 +315,38 @@ export class PollingSource implements EventSource {
   }
 
   private async flushAcks(): Promise<void> {
-    // Skip if a previous flush is still in flight — prevents
-    // overlapping drains that would issue duplicate ack POSTs
-    // when the registry is slow or many acks are pending.
-    if (this.flushingAcks) return;
+    if (this.flushingAcks) {
+      this.logger.debug?.('flushAcks: previous drain still in flight; tick skipped');
+      return;
+    }
     this.flushingAcks = true;
     try {
       const ids = await this.store.drainAcks();
       if (ids.length === 0) return;
-      await Promise.allSettled(ids.map(async (id) => this.sendAck(id)));
+      // Cap concurrent ack POSTs. A 10k-event backlog after a
+      // restart would otherwise fire 10k simultaneous fetches and
+      // exhaust the local HTTP pool / spike the registry.
+      await withConcurrency(ids, this.ackConcurrency, async (id) => {
+        await this.sendAck(id);
+      });
     } finally {
       this.flushingAcks = false;
     }
   }
 
+  /** 4xx (except 429) is permanent — request itself is bad. Never retry. */
+  private isPermanentAckFailure(status: number): boolean {
+    return status >= 400 && status < 500 && status !== 429;
+  }
+
   private async sendAck(eventId: string): Promise<void> {
     if (!eventId || typeof eventId !== 'string' || eventId.length > 256) {
       this.logger.warn?.(`refusing to ack malformed event id`);
+      this.ackRetries.delete(eventId);
       return;
     }
     const url = `${this.registryUrl}/caep/acknowledge/${encodeURIComponent(eventId)}`;
+    let outcome: 'success' | 'transient' | 'permanent';
     try {
       const response = await fetchWithTimeout(
         this.fetchImpl,
@@ -306,17 +354,47 @@ export class PollingSource implements EventSource {
         { method: 'POST', headers: this.headers },
         this.requestTimeoutMs,
       );
-      if (!response.ok) {
-        // Re-queue and let the next drain retry; the registry holds events for 90d.
-        await this.store.enqueueAck(eventId);
-        this.logger.warn?.(`ack for ${eventId} returned HTTP ${response.status}; re-queued`);
+      if (response.ok) {
+        outcome = 'success';
+      } else if (this.isPermanentAckFailure(response.status)) {
+        outcome = 'permanent';
+        this.logger.warn?.(
+          `ack for ${eventId} returned HTTP ${response.status} (permanent); dropping`,
+        );
       } else {
-        this.logger.debug?.(`acked ${eventId}`);
+        outcome = 'transient';
+        this.logger.warn?.(
+          `ack for ${eventId} returned HTTP ${response.status}; will retry`,
+        );
       }
     } catch (err) {
-      await this.store.enqueueAck(eventId);
-      this.logger.warn?.(`ack for ${eventId} failed; re-queued`, err);
+      outcome = 'transient';
+      this.logger.warn?.(`ack for ${eventId} failed (transient); will retry`, err);
     }
+
+    if (outcome === 'success') {
+      this.ackRetries.delete(eventId);
+      this.logger.debug?.(`acked ${eventId}`);
+      return;
+    }
+    if (outcome === 'permanent') {
+      this.ackRetries.delete(eventId);
+      return;
+    }
+    // Transient: re-enqueue if under the retry cap; otherwise drop.
+    // Dropping is safe — acks are best-effort and the registry retains
+    // events for 90 days; the polling cursor has already advanced.
+    const attempts = (this.ackRetries.get(eventId) ?? 0) + 1;
+    if (attempts >= this.maxAckRetries) {
+      this.ackRetries.delete(eventId);
+      this.logger.warn?.(
+        `ack for ${eventId} exceeded ${this.maxAckRetries} retries; dropping ` +
+          `(safe — registry retains events for 90 days)`,
+      );
+      return;
+    }
+    this.ackRetries.set(eventId, attempts);
+    await this.store.enqueueAck(eventId);
   }
 }
 

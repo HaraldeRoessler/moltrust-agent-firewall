@@ -7,6 +7,8 @@ import {
 } from '../types.js';
 import {
   assertJsonResponse,
+  base64UrlDecode,
+  defaultRequestHeaders,
   fetchWithTimeout,
   readJsonBoundedBody,
   validateRegistryUrl,
@@ -107,7 +109,7 @@ export class RegistryKeyDiscovery {
       response = await fetchWithTimeout(
         this.fetchImpl,
         url,
-        { method: 'GET', headers: { Accept: 'application/json' } },
+        { method: 'GET', headers: defaultRequestHeaders() },
         this.requestTimeoutMs,
       );
     } catch (err) {
@@ -190,11 +192,3 @@ function parseCacheControl(header: string | null, maxTtlMs: number): number {
   return ms;
 }
 
-function base64UrlDecode(s: string): Uint8Array {
-  // RFC 7515 base64url: '-' -> '+', '_' -> '/', no padding
-  const pad = s.length % 4;
-  const padded = pad ? s + '='.repeat(4 - pad) : s;
-  const std = padded.replace(/-/g, '+').replace(/_/g, '/');
-  const buf = Buffer.from(std, 'base64');
-  return new Uint8Array(buf);
-}

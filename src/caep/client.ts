@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   DEFAULT_REGISTRY,
+  MoltrustFirewallError,
   PROFILE_ID,
   type CaepEvent,
   type CaepEventType,
@@ -17,9 +18,16 @@ import { assertValidDid, validateRegistryUrl } from '../util/security.js';
 /** Max bytes for flag payload values — defensive cap against compromised-registry log/memory blowup. */
 const MAX_FLAG_LENGTH = 256;
 
-function extractFlag(value: unknown): string {
+/** Minimum interval between distinct fetches for the same DID. */
+const DEFAULT_MIN_FETCH_INTERVAL_MS = 1_000;
+
+function extractFlag(value: unknown, onTruncated?: (originalLength: number) => void): string {
   if (typeof value !== 'string') return '';
-  return value.slice(0, MAX_FLAG_LENGTH);
+  if (value.length > MAX_FLAG_LENGTH) {
+    onTruncated?.(value.length);
+    return value.slice(0, MAX_FLAG_LENGTH);
+  }
+  return value;
 }
 
 /** Strongly-typed event map for `MoltrustCaepClient`. */
@@ -95,6 +103,24 @@ export interface MoltrustCaepClientOptions {
    * will become a no-op for verified events.
    */
   dropUnsignedEvents?: boolean;
+  /**
+   * Minimum wall-clock interval between consecutive `getVerifiedScore`
+   * network fetches for the same DID. Defaults to 1000ms. Within this
+   * window, repeated calls return the cached score even if its
+   * `valid_until` has passed; once the interval elapses, the next call
+   * is allowed to re-fetch.
+   *
+   * The cache + this rate limit together prevent tight-loop callers
+   * (and accidentally-broken control flow) from hammering the registry
+   * — the singleflight protects against concurrent storms; this
+   * protects against serial loops.
+   */
+  minFetchIntervalMs?: number;
+  /**
+   * Optional logger for non-fatal client-internal events (auto-verify
+   * failures, truncated flags, etc.). Defaults to silent.
+   */
+  logger?: { warn?(msg: string, ...meta: unknown[]): void; debug?(msg: string, ...meta: unknown[]): void };
 }
 
 /**
@@ -120,7 +146,11 @@ export class MoltrustCaepClient extends EventEmitter {
   public readonly source: EventSource;
   private readonly autoVerify: boolean;
   private readonly dropUnsignedEvents: boolean;
+  private readonly minFetchIntervalMs: number;
   private readonly inflightFetches = new Map<Did, Promise<VerifiedTrustScore>>();
+  /** Wall-clock ms at which we last (started) a verifier fetch for this DID. */
+  private readonly lastFetchAt = new Map<Did, number>();
+  private readonly logger: Required<MoltrustCaepClientOptions>['logger'];
   private started = false;
 
   constructor(opts: MoltrustCaepClientOptions = {}) {
@@ -153,6 +183,8 @@ export class MoltrustCaepClient extends EventEmitter {
     // Secure-by-default: unsigned CAEP events (did_revoked, flag_*) are
     // dropped from typed handlers unless the operator explicitly opts in.
     this.dropUnsignedEvents = opts.dropUnsignedEvents ?? true;
+    this.minFetchIntervalMs = Math.max(0, opts.minFetchIntervalMs ?? DEFAULT_MIN_FETCH_INTERVAL_MS);
+    this.logger = opts.logger ?? {};
     // EventEmitter default is 10 — too low for fan-out into per-tenant
     // gates or many gateway instances. 0 = unlimited; the application
     // is in a better position than the library to bound listener counts.
@@ -215,6 +247,20 @@ export class MoltrustCaepClient extends EventEmitter {
     if (cached) return cached;
     const existing = this.inflightFetches.get(did);
     if (existing) return existing;
+    // Rate limit per DID: refuse to issue a new fetch within
+    // `minFetchIntervalMs` of the previous one. Protects against
+    // serial-loop misuse that the singleflight (concurrent dedup)
+    // alone cannot catch.
+    const last = this.lastFetchAt.get(did);
+    if (last !== undefined && Date.now() - last < this.minFetchIntervalMs) {
+      const remaining = this.minFetchIntervalMs - (Date.now() - last);
+      throw new MoltrustFirewallError(
+        `getVerifiedScore for ${did} called within ${remaining}ms of the previous fetch; ` +
+          `wait at least ${remaining}ms before retrying (or rely on the cache)`,
+        'rate_limited_client',
+      );
+    }
+    this.lastFetchAt.set(did, Date.now());
     const promise = this.verifier
       .fetchAndVerify(did)
       .then((score) => {
@@ -279,14 +325,22 @@ export class MoltrustCaepClient extends EventEmitter {
         }
         case 'flag_added': {
           if (!this.dropUnsignedEvents) {
-            const flag = extractFlag(raw.payload['flag']);
+            const flag = extractFlag(raw.payload['flag'], (original) =>
+              this.logger.warn?.(
+                `truncated oversized flag value from ${original} to ${MAX_FLAG_LENGTH} chars (event ${raw.event_id})`,
+              ),
+            );
             this.emit('flag_added', raw.subject_did, flag, raw);
           }
           break;
         }
         case 'flag_removed': {
           if (!this.dropUnsignedEvents) {
-            const flag = extractFlag(raw.payload['flag']);
+            const flag = extractFlag(raw.payload['flag'], (original) =>
+              this.logger.warn?.(
+                `truncated oversized flag value from ${original} to ${MAX_FLAG_LENGTH} chars (event ${raw.event_id})`,
+              ),
+            );
             this.emit('flag_removed', raw.subject_did, flag, raw);
           }
           break;
@@ -298,7 +352,15 @@ export class MoltrustCaepClient extends EventEmitter {
           break;
       }
     } catch (err) {
-      this.emit('error', err);
+      // EventEmitter convention: emitting 'error' with no listeners
+      // throws an uncaught exception that crashes the process. Guard
+      // by checking listener count first; if none, log via the
+      // optional logger and swallow.
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', err);
+      } else {
+        this.logger.warn?.('CAEP event handler threw (no \'error\' listener attached)', err);
+      }
     }
   }
 }

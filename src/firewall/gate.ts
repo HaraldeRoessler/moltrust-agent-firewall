@@ -79,18 +79,45 @@ export class EnforcementGate {
   private readonly rejectWithheld: boolean;
   private readonly denylist: Set<Did>;
   private readonly transientErrorPolicy: 'allow' | 'deny';
+  /** Bound listener kept so `dispose()` can detach it cleanly. */
+  private readonly onRevoked: (did: Did) => void;
 
   constructor(
     private readonly client: MoltrustCaepClient,
     opts: GateOptions = {},
   ) {
-    this.minScore = opts.minScore ?? 0;
+    const minScore = opts.minScore ?? 0;
+    if (!Number.isFinite(minScore) || minScore < 0 || minScore > 100) {
+      throw new MoltrustFirewallError(
+        `minScore must be a finite number in 0..100 (got ${minScore})`,
+        'invalid_min_score',
+      );
+    }
+    this.minScore = minScore;
     this.rejectWithheld = opts.rejectWithheld ?? true;
     this.denylist = opts.denylist ?? new Set();
     this.transientErrorPolicy = opts.transientErrorPolicy ?? 'deny';
-    client.on('did_revoked', (did) => {
+    // NOTE: the client defaults to dropUnsignedEvents=true, which means
+    // did_revoked typed handlers are not invoked unless the operator
+    // explicitly opts in. In that case the auto-denylist below is dead
+    // code — revocations still propagate, but only via the next signed
+    // /skill/trust-score lookup. Document this trade-off so an operator
+    // doesn't expect denylist auto-population in the default config.
+    this.onRevoked = (did) => {
       this.denylist.add(did);
-    });
+    };
+    client.on('did_revoked', this.onRevoked);
+  }
+
+  /**
+   * Detaches the gate's listener from the client. Call this when the
+   * gate's lifetime ends (e.g. a per-tenant middleware being torn
+   * down). Otherwise the listener stays attached to the long-lived
+   * client and the gate is kept alive by it — a memory leak in
+   * dynamic / multi-tenant environments.
+   */
+  dispose(): void {
+    this.client.off('did_revoked', this.onRevoked);
   }
 
   /** Manually mark a DID as denied (e.g. operator action). */

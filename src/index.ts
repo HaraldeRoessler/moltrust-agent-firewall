@@ -63,11 +63,15 @@ export { EnforcementGate, type GateDecision, type GateOptions } from './firewall
 export {
   assertJsonResponse,
   assertValidDid,
+  base64UrlDecode,
   DEFAULT_MAX_RESPONSE_BYTES,
+  isStrictIso8601,
   isValidCaepEvent,
   isValidDid,
   readJsonBoundedBody,
   sanitiseUrl,
   summariseCaepEvent,
+  USER_AGENT,
   validateRegistryUrl,
 } from './util/security.js';
+export { withConcurrency } from './util/concurrency.js';
