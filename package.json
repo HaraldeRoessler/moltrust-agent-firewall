@@ -1,0 +1,65 @@
+{
+  "name": "@moltrust/agent-firewall",
+  "version": "1.0.0",
+  "description": "Consumer library for the MolTrust trust registry. Implements the MolTrust CAEP Profile v1 (polling) and signed trust-score verification (RFC 8785 JCS + Ed25519). Lets agent operators react to revocations, flag changes, and trust-score updates from api.moltrust.ch.",
+  "keywords": [
+    "moltrust",
+    "agent-firewall",
+    "caep",
+    "trust",
+    "did",
+    "ed25519",
+    "rfc8785",
+    "jcs",
+    "agent-economy",
+    "agent-trust"
+  ],
+  "homepage": "https://moltrust.ch",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MoltyCel/moltrust-agent-firewall"
+  },
+  "bugs": {
+    "url": "https://github.com/MoltyCel/moltrust-agent-firewall/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "PROFILE.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "canonicalize": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
