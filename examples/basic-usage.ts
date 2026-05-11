@@ -3,11 +3,15 @@
  * for DIDs whose verified score falls below 60.
  *
  * Run with:
- *   npx tsx examples/basic-usage.ts
+ *   npx tsx examples/basic-usage.ts did:moltrust:<your-agent>
  */
 import { EnforcementGate, MoltrustCaepClient } from '../src/index.js';
 
-const WATCH_DID = process.argv[2] ?? 'did:moltrust:a4adbea0a1344bf4';
+const WATCH_DID = process.argv[2];
+if (!WATCH_DID) {
+  console.error('usage: tsx examples/basic-usage.ts <did:moltrust:...>');
+  process.exit(1);
+}
 
 async function main(): Promise<void> {
   const client = new MoltrustCaepClient({

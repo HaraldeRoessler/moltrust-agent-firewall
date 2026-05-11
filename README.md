@@ -28,7 +28,8 @@ Requires Node 18+. Pure JavaScript, no native dependencies.
 import { MoltrustCaepClient } from '@moltrust/agent-firewall';
 
 const client = new MoltrustCaepClient({
-  watch: ['did:moltrust:a4adbea0a1344bf4'],
+  // Your own agent's DID, or the counterparties you want events about.
+  watch: ['did:moltrust:0000000000000000'],
 });
 
 client.on('trust_score_change', (verified, raw) => {
